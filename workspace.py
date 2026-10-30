@@ -1,0 +1,60 @@
+import shutil
+import tempfile
+from pathlib import Path
+
+
+def create_workspace(
+    source_project: str,
+    workspace_base: str,
+) -> Path:
+    """
+    将示例项目复制到用户指定的工作目录。
+
+    Args:
+        source_project: 原始项目的根目录。
+        workspace_base: 保存工作副本的父目录。
+
+    Returns:
+        本次任务工作副本的项目根目录。
+    """
+    source_path = Path(source_project).resolve()
+    base_path = Path(workspace_base).resolve()
+
+    if not source_path.is_dir():
+        raise ValueError(
+            f"源项目不存在或不是目录：{source_path}"
+        )
+
+    # 避免将工作副本创建在源项目内部。
+    if base_path.is_relative_to(source_path):
+        raise ValueError(
+            "工作副本的父目录不能放在源项目内部，"
+            "请指定一个独立的目录。"
+        )
+
+    # 如果指定的父目录不存在，就创建它。
+    base_path.mkdir(parents=True, exist_ok=True)
+
+    # 在指定父目录下创建一个唯一的任务目录。
+    workspace_root = Path(
+        tempfile.mkdtemp(
+            prefix="fault_repair_",
+            dir=str(base_path),
+        )
+    )
+
+    working_project = workspace_root / "project"
+
+    # 将原项目复制到任务目录。
+    shutil.copytree(
+        source_path,
+        working_project,
+        ignore=shutil.ignore_patterns(
+            ".git",
+            ".venv",
+            "__pycache__",
+            ".pytest_cache",
+        ),
+    )
+
+    return working_project

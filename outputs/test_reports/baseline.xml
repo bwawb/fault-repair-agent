@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="utf-8"?><testsuites name="pytest tests"><testsuite name="pytest" errors="0" failures="2" skipped="0" tests="4" time="0.250" timestamp="2026-10-31T00:00:12.930324+08:00" hostname="LAPTOP-PKLI8RN9"><testcase classname="tests.test_calculator" name="test_calculate_average_with_numbers" time="0.001" /><testcase classname="tests.test_calculator" name="test_calculate_average_with_empty_list" time="0.001"><failure message="ZeroDivisionError: division by zero">def test_calculate_average_with_empty_list():
+        """输入空列表时，应该抛出ValueError"""
+        with pytest.raises(ValueError):
+&gt;           calculate_average([])
+
+tests\test_calculator.py:14: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+numbers = []
+
+    def calculate_average(numbers: list[float]) -&gt; float:
+        """
+        计算一组数字的平均值。
+    
+        当列表为空时，抛出 ValueError。
+        """
+&gt;       return sum(numbers) / len(numbers)
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E       ZeroDivisionError: division by zero
+
+calculator.py:7: ZeroDivisionError</failure></testcase><testcase classname="tests.test_order_service" name="test_create_order_without_discount" time="0.001" /><testcase classname="tests.test_order_service" name="test_create_order_with_discount" time="0.001"><failure message="assert 200 == 160">def test_create_order_with_discount():
+        """原价 200，折扣 20% 时，最终价格应为 160。"""
+        result = create_order("book", 200, 20)
+    
+&gt;       assert result["final_price"] == 160
+E       assert 200 == 160
+
+tests\test_order_service.py:15: AssertionError</failure></testcase></testsuite></testsuites>

@@ -1,0 +1,7 @@
+.env
+.idea/
+.venv/
+__pycache__/
+.pytest_cache/
+.outputs/
+.fault_repair_bbv2zsnz/
