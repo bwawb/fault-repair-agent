@@ -2,6 +2,7 @@ from langchain.agents import create_agent
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langgraph.errors import GraphRecursionError
 from uuid import uuid4
+from datetime import datetime
 
 from demo_tool_call import create_model
 from tools.langchain_tools import create_langchain_tools
@@ -45,19 +46,69 @@ SYSTEM_PROMPT = """
 8. 不要声称修改已经应用，也不要声称修改后的测试已经通过。
 """
 
+
+def save_checkpoint(report):
+    """
+    保存当前任务报告。
+    同一个 task_id 会覆盖更新同一份 JSON。
+    """
+    return save_run_report(report)
+
+
+def finish_report(report, final_status):
+    """
+    完成任务，记录最终状态和完成时间。
+    """
+    report["task"]["completed_at"] = (
+        datetime.now().astimezone().isoformat()
+    )
+
+    report["final_status"] = final_status
+
+    return save_checkpoint(report)
+
+
 def main():
     # 修改为你自己的示例项目路径。
 
     source_project = r"E:\PythonProject\demo-python-project"
 
+    # 1. 创建任务 ID
+    run_id = uuid4().hex
 
-    working_project = create_workspace(source_project, r"E:\PythonProject\fault-repair-agent")
+    # 2. 记录任务开始时间
+    started_at = datetime.now().astimezone().isoformat()
+
+    # 3. 用户任务
+    user_request = (
+        "订单折扣计算存在问题。"
+        "请运行测试，找到折扣问题的相关代码，"
+        "分析故障原因，并生成最小修改的 diff 预览。"
+        "本次只处理订单折扣问题。"
+    )
+
+    # 4. 创建工作副本
+    working_project = create_workspace(source_project, r"E:\PythonProject\fault-repair-agent\copy")
 
     print(f"工作副本：{working_project}")
 
+    # 5. 初始化统一任务报告
+    report = build_run_report(
+        user_request=user_request,
+        messages=[],
+        task_id=run_id,
+        source_project=source_project,
+        working_project=str(working_project),
+        started_at=started_at,
+    )
+
+    # 6. 首次保存报告
+    report_path = save_checkpoint(report)
+
+    print(f"任务报告：{report_path}")
     # project_path = r"E:\PythonProject\demo-python-project"
 
-    run_id = uuid4().hex
+    # run_id = uuid4().hex
     # 报告保存在本次任务目录下，与 project 同级
     report_dir = working_project.parent / "reports"
 
@@ -75,9 +126,27 @@ def main():
     print(f"pytest 退出码：{baseline_run['exit_code']}")
     print(baseline_run["output"])
 
+    # 将修复前测试的执行结果写入统一报告
+    report['verification']['baseline']={
+        "status": baseline_run["status"],
+        "exit_code": baseline_run["exit_code"],
+        "output": baseline_run["output"],
+        "report_path":str(baseline_path),
+        "test_results": None
+    }
+
+    # 保存当前进度
+    save_checkpoint(report)
+
+    # # 仅用于本次验证，验证后删除
+    # baseline_run["status"] = "simulated_error"
+
     if baseline_run["status"] != "completed":
         print("修复前测试未正常完成，无法建立测试基线。")
         print(f"工作副本：{working_project}")
+
+        # 记录任务因基线测试无法完成而结束
+        finish_report(report, final_status="baseline_test_error")
         return
 
     try:
@@ -86,7 +155,18 @@ def main():
         )
     except (OSError, ValueError) as exc:
         print(f"读取修复前测试报告失败：{exc}")
+
+        # 将失败原因写入报告，便于排查
+        report["verification"]["baseline"]["report_error"] = str(exc)
+        finish_report(report, final_status="baseline_report_error")
+
         return
+
+    # 将解析后的测试状态写入报告
+    report["verification"]["baseline"]["test_results"]=baseline_results
+
+    # 保存更新
+    save_checkpoint(report)
 
     # 1.创建模型
     model = create_model()
@@ -128,6 +208,7 @@ def main():
         )
     except GraphRecursionError:
         print("\nAgent 达到执行步数上限，分析未完成。")
+        finish_report(report, final_status="agent_step_limit")
         return
 
     # 6. 查看 Agent 运行过程中产生的消息。
@@ -146,25 +227,51 @@ def main():
     print(result["messages"][-1].content)
 
     # 整理 Agent 本次运行的消息。
-    report = build_run_report(
+    agent_report = build_run_report(
         user_request=user_request,
         messages=result["messages"],
     )
 
-    # 保存运行记录。
-    report_path = save_run_report(report)
+    # 只更新原有报告中的 Agent 信息。
+    report["agent"] = agent_report["agent"]
+
+    # 使用原来的task_id保存信息
+    report_path = save_checkpoint(report)
+
+    # # 保存到原来的 JSON 文件。
+    # report_path = save_checkpoint(report)
+
+    print(f"任务报告已更新：{report_path}")
 
     print("\n===== 提取修改提案 =====")
 
-    proposal_result = extract_latest_preview(
-        result["messages"]
-    )
+    proposal_result = extract_latest_preview(result["messages"])
 
     if not proposal_result["success"]:
         print(proposal_result["message"])
+
+        # 记录为什么无法进入修改阶段
+        report["proposal"]["status"] = "extraction_failed"
+        report["proposal"]["message"] = proposal_result["message"]
+
+        # 结束任务并保存报告
+        finish_report(report, final_status="proposal_unavaliable")
         return
 
     proposal = proposal_result["proposal"]
+
+    # 将提取出的修改提案写入统一报告
+    report['proposal'] = {
+        "status": "generated",
+        "tool_call_id":proposal["tool_call_id"],
+        "relative_path":proposal["relative_path"],
+        "old_text": proposal["old_text"],
+        "new_text": proposal["new_text"],
+        "diff":proposal["diff"]
+    }
+
+    # 保存当前进度
+    save_checkpoint(report)
 
     print(f"工具调用 ID：{proposal['tool_call_id']}")
     print(f"目标文件：{proposal['relative_path']}")
@@ -185,11 +292,38 @@ def main():
         proposal=proposal,
     )
 
+    # 记录用户是否同意应用修改
+    report["approval"] = {
+        "status": apply_result["approval_status"],
+    }
+
+    # 记录修改是否应用
+    if apply_result["status"] == "rejected":
+        report["application"] = {
+            "status": "not_attempted",
+            "message": apply_result["message"]
+        }
+    else:
+        report["application"] = {
+            "status": apply_result["status"],
+            "message": apply_result["message"],
+        }
+
+    # 保存当前进度
+    save_checkpoint(report)
+
     print(f"修改状态：{apply_result['status']}")
     print(f"说明：{apply_result['message']}")
 
+    # 放在return之前是因为用户取消或者应用失败时，程序会直接return提前结束
     if apply_result["status"] != "applied":
         print(f"\n本次工作副本保存在：{working_project}")
+
+        if apply_result["status"] == "rejected":
+            finish_report(report, final_status="cancelled")
+        else:
+            finish_report(report, final_status="application_error")
+
         return
 
     print("\n===== 运行修复后测试 =====")
@@ -203,25 +337,47 @@ def main():
     print("测试输出：")
     print(after_run["output"])
 
+    # 记录修复后的测试运行结果
+    report["verification"]["after_fix"] = {
+        "status": after_run["status"],
+        "exit_code": after_run["exit_code"],
+        "output": after_run["output"],
+        "report_path": str(after_fix_path),
+        "test_results": None,
+    }
+
+    save_checkpoint(report)
+
     if after_run["status"] != "completed":
         print("修复后测试未正常完成，无法比较测试结果。")
         print(f"工作副本：{working_project}")
+        finish_report(report, final_status="after_test_error")
         return
 
     try:
-        after_results = read_test_report(
-            after_run["report_path"]
-        )
+        after_results = read_test_report(after_run["report_path"])
     except (OSError, ValueError) as exc:
         print(f"读取修复后测试报告失败：{exc}")
         print(f"工作副本：{working_project}")
+
+        report["verification"]["after_fix"]["report_error"] = str(exc)
+        finish_report(report, final_status="after_report_error")
         return
+
+    # 记录修复后每个测试用例的状态
+    report["verification"]["after_fix"]["test_results"] = after_results
+    save_checkpoint(report)
 
     # 比较每个测试在修复前后的状态。
     comparison = compare_results(
         before=baseline_results,
         after=after_results,
     )
+
+    # 记录修复前后的测试对比
+    report["verification"]["comparison"] = comparison
+    save_checkpoint(report)
+
 
     print("\n===== 修复前后测试结果对比 =====")
 
@@ -270,6 +426,14 @@ def main():
     print(f"\n修复前报告：{baseline_path}")
     print(f"修复后报告：{after_fix_path}")
     print(f"工作副本：{working_project}")
+
+    # 正常完成测试对比后，更新任务的结束状态
+    report_path = finish_report(
+        report,
+        final_status="completed"
+    )
+
+    print(f"最终报任务报告：{report_path}")
 
 
     # print("\n===== 运行记录 =====")

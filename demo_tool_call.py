@@ -8,7 +8,8 @@ from langchain_openai import ChatOpenAI
 
 from tools.tool_registry import ToolRegistry
 
-load_dotenv(Path(__file__).resolve().parent / ".env")
+load_dotenv()
+
 
 def create_model() -> ChatOpenAI:
     """根据环境变量创建聊天模型"""

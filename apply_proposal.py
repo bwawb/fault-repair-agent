@@ -24,6 +24,9 @@ def confirm_and_apply(project_path: str, proposal: dict, ) -> dict:
 
     project_root = Path(project_path).resolve()
 
+    # 初始状态：还没有询问用户
+    approval_status = "not_requested"
+
     # 获取Agent调用工具的传入的参数内容
     relative_path = proposal.get("relative_path")
     old_text = proposal.get("old_text")
@@ -35,24 +38,28 @@ def confirm_and_apply(project_path: str, proposal: dict, ) -> dict:
         return {
             "status": "error",
             "message": "提案缺少有效的目标文件路径。",
+            "approval_status": approval_status,
         }
 
     if not isinstance(old_text, str) or not old_text:
         return {
             "status": "error",
             "message": "提案缺少有效的原文本。",
+            "approval_status": approval_status,
         }
 
     if not isinstance(new_text, str):
         return {
             "status": "error",
             "message": "提案的新文本必须是字符串。",
+            "approval_status": approval_status,
         }
 
     if not isinstance(original_diff, str) or not original_diff:
         return {
             "status": "error",
             "message": "提案缺少有效的 diff。",
+            "approval_status": approval_status,
         }
 
     # 当前版本先限定为单行替换，便于和字节匹配保持一致。
@@ -60,6 +67,7 @@ def confirm_and_apply(project_path: str, proposal: dict, ) -> dict:
         return {
             "status": "error",
             "message": "当前版本只支持单行文本替换。",
+            "approval_status": approval_status,
         }
 
     requested_path = Path(relative_path)
@@ -68,6 +76,7 @@ def confirm_and_apply(project_path: str, proposal: dict, ) -> dict:
         return {
             "status": "error",
             "message": "目标路径必须相对于工作目录。",
+            "approval_status": approval_status,
         }
 
     target_path = (project_root / requested_path).resolve()
@@ -77,6 +86,7 @@ def confirm_and_apply(project_path: str, proposal: dict, ) -> dict:
         return {
             "status": "error",
             "message": "不允许修改工作目录之外的文件。",
+            "approval_status": approval_status,
         }
 
 
@@ -87,12 +97,14 @@ def confirm_and_apply(project_path: str, proposal: dict, ) -> dict:
         return {
             "status": "error",
             "message": "当前阶段不允许修改 tests 目录中的文件。",
+            "approval_status": approval_status,
         }
 
     if not target_path.is_file():
         return {
             "status": "error",
             "message": f"目标文件不存在：{relative_path}",
+            "approval_status": approval_status,
         }
 
     try:
@@ -113,6 +125,7 @@ def confirm_and_apply(project_path: str, proposal: dict, ) -> dict:
             return {
                 "status": "error",
                 "message": f"重新预览失败：{preview['message']}",
+                "approval_status": approval_status,
             }
 
         # 确认预览期间文件没有变化。
@@ -124,6 +137,7 @@ def confirm_and_apply(project_path: str, proposal: dict, ) -> dict:
             return {
                 "status": "error",
                 "message": "文件在生成预览时发生变化，请重新分析。",
+                "approval_status": approval_status,
             }
 
         # 确认重新生成的 diff 与 Agent 提案中的 diff 一致。
@@ -131,6 +145,7 @@ def confirm_and_apply(project_path: str, proposal: dict, ) -> dict:
             return {
                 "status": "error",
                 "message": "当前 diff 与 Agent 的原始预览不一致，请重新分析。",
+                "approval_status": approval_status,
             }
 
         # 5. 展示本次实际准备应用的 diff。
@@ -143,10 +158,15 @@ def confirm_and_apply(project_path: str, proposal: dict, ) -> dict:
         ).strip().lower()
 
         if decision != "yes":
+            approval_status="rejected"
+
+
             return {
                 "status": "rejected",
                 "message": "用户取消了修改。",
+                "approval_status": approval_status,
             }
+        approval_status = "approved"
 
         # 6. 确认后再次检查文件版本。
         current_bytes = target_path.read_bytes()
@@ -155,6 +175,7 @@ def confirm_and_apply(project_path: str, proposal: dict, ) -> dict:
             return {
                 "status": "error",
                 "message": "文件在确认期间发生变化，请重新预览。",
+                "approval_status": approval_status,
             }
 
         old_bytes = old_text.encode("utf-8")
@@ -169,6 +190,7 @@ def confirm_and_apply(project_path: str, proposal: dict, ) -> dict:
                     f"原文本出现 {match_count} 次，"
                     "无法确定唯一修改位置。"
                 ),
+                "approval_status": approval_status,
             }
 
         # 7. 替换并写入工作副本。
@@ -187,6 +209,7 @@ def confirm_and_apply(project_path: str, proposal: dict, ) -> dict:
             "before_hash": before_preview_hash,
             "after_hash": sha256_bytes(modified_bytes),
             "diff": preview["diff"],
+            "approval_status": approval_status,
         }
 
 
@@ -197,7 +220,7 @@ def confirm_and_apply(project_path: str, proposal: dict, ) -> dict:
         return {
 
             "status": "error",
-
             "message": f"处理修改时发生错误：{exc}",
+            "approval_status": approval_status,
 
         }
