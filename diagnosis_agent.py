@@ -3,6 +3,8 @@ from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langgraph.errors import GraphRecursionError
 from uuid import uuid4
 from datetime import datetime
+from copy import deepcopy
+
 
 from demo_tool_call import create_model
 from tools.langchain_tools import create_langchain_tools
@@ -13,6 +15,7 @@ from apply_proposal import confirm_and_apply
 from tools.test_tools import TestTools
 from workspace import create_workspace
 from compare_test_reports import read_test_report, compare_results
+from repair_decision import decide_next_step
 
 
 # SYSTEM_PROMPT = """
@@ -87,6 +90,12 @@ def main():
         "本次只处理订单折扣问题。"
     )
 
+    # 本次任务要修复的目标测试
+    # 格式与read_test_report()返回测试标识保持一致
+    target_test_ids = [
+        "tests.test_order_service::test_create_order_with_discount",
+    ]
+
     # 4. 创建工作副本
     working_project = create_workspace(source_project, r"E:\PythonProject\fault-repair-agent\copy")
 
@@ -101,6 +110,11 @@ def main():
         working_project=str(working_project),
         started_at=started_at,
     )
+
+    # 即使后续步骤失败，也能在报告中看到本次的修复目标
+    report["task"]["target_test_ids"] = target_test_ids
+
+    report["rounds"] = []
 
     # 6. 首次保存报告
     report_path = save_checkpoint(report)
@@ -163,9 +177,62 @@ def main():
         return
 
     # 将解析后的测试状态写入报告
-    report["verification"]["baseline"]["test_results"]=baseline_results
+    report["verification"]["baseline"]["test_results"] = baseline_results
 
-    # 保存更新
+    print("\n===== 检查目标测试基线 =====")
+
+    # 检查目标测试是否都存在于基线报告
+    missing_targets = [
+        test_id
+        for test_id in target_test_ids
+        if test_id not in baseline_results
+    ]
+
+    if missing_targets:
+        print("以下目标测试不在基线报告中：")
+        for test_id in missing_targets:
+            print(f"  {test_id}")
+
+        report["verification"]["target_baseline"] = {
+            "status": "missing",
+            "missing_tests": missing_targets,
+            "test_results": None,
+        }
+
+        finish_report(report, final_status="target_tests_missing")
+        return
+
+    # 记录目标测试修复前的状态
+    target_baseline_results = {
+        test_id: baseline_results[test_id]
+        for test_id in target_test_ids
+    }
+
+    report["verification"]["target_baseline"] = {
+        "status": "recorded",
+        "missing_tests": [],
+        "test_results": target_baseline_results,
+    }
+
+    save_checkpoint(report)
+
+    for test_id, status in target_baseline_results.items():
+        print(f"  {test_id}: {status}")
+
+    # # 保存更新
+    # save_checkpoint(report)
+
+    # 开始第一轮修复
+    round_record = {
+        "round_number" : 1,
+        "status": "in_progress",
+        "agent": None,
+        "proposal": None,
+        "application": None,
+        "verification": None
+    }
+
+    report["rounds"].append(round_record)
     save_checkpoint(report)
 
     # 1.创建模型
@@ -208,6 +275,7 @@ def main():
         )
     except GraphRecursionError:
         print("\nAgent 达到执行步数上限，分析未完成。")
+        round_record["status"] = "agent_step_limit"
         finish_report(report, final_status="agent_step_limit")
         return
 
@@ -235,6 +303,9 @@ def main():
     # 只更新原有报告中的 Agent 信息。
     report["agent"] = agent_report["agent"]
 
+    # 保存第一轮的Agent信息
+    round_record["agent"] = deepcopy(report["agent"])
+
     # 使用原来的task_id保存信息
     report_path = save_checkpoint(report)
 
@@ -254,6 +325,9 @@ def main():
         report["proposal"]["status"] = "extraction_failed"
         report["proposal"]["message"] = proposal_result["message"]
 
+        round_record["proposal"] = deepcopy(report["proposal"])
+        round_record["status"] = "proposal_unavailable"
+
         # 结束任务并保存报告
         finish_report(report, final_status="proposal_unavaliable")
         return
@@ -269,6 +343,9 @@ def main():
         "new_text": proposal["new_text"],
         "diff":proposal["diff"]
     }
+
+    # 将本次提案保存到第一轮
+    round_record["proposal"] = deepcopy(report["proposal"])
 
     # 保存当前进度
     save_checkpoint(report)
@@ -309,6 +386,9 @@ def main():
             "message": apply_result["message"],
         }
 
+    round_record["approval"] = deepcopy(report["approval"])
+    round_record["application"] = deepcopy(report["application"])
+
     # 保存当前进度
     save_checkpoint(report)
 
@@ -320,8 +400,10 @@ def main():
         print(f"\n本次工作副本保存在：{working_project}")
 
         if apply_result["status"] == "rejected":
+            round_record["status"] = "cancelled"
             finish_report(report, final_status="cancelled")
         else:
+            round_record["status"] = "application_error"
             finish_report(report, final_status="application_error")
 
         return
@@ -346,11 +428,21 @@ def main():
         "test_results": None,
     }
 
+    # 先记录测试进程结果，后续解析成功后再更新
+    round_record["verification"] = {
+        "after_fix": deepcopy(report["verification"]["after_fix"]),
+        "comparison": None
+    }
+
     save_checkpoint(report)
 
     if after_run["status"] != "completed":
         print("修复后测试未正常完成，无法比较测试结果。")
         print(f"工作副本：{working_project}")
+
+        # 记录第一轮的结束原因
+        round_record["status"] = "after_test_error"
+
         finish_report(report, final_status="after_test_error")
         return
 
@@ -361,6 +453,13 @@ def main():
         print(f"工作副本：{working_project}")
 
         report["verification"]["after_fix"]["report_error"] = str(exc)
+
+        # 同步当前轮次
+        round_record["verification"]["after_fix"] = deepcopy(
+            report["verification"]["after_fix"]
+        )
+        round_record["status"] = "after_report_error"
+
         finish_report(report, final_status="after_report_error")
         return
 
@@ -374,8 +473,38 @@ def main():
         after=after_results,
     )
 
+    # 目前仍是单轮流程，先固定为第一轮
+    current_round = 1
+    max_rounds = 3
+
+    decision = decide_next_step(
+        target_test_ids=target_test_ids,
+        baseline_results=baseline_results,
+        after_results=after_results,
+        current_round=current_round,
+        max_rounds=max_rounds,
+    )
+
+    print("\n===== 下一步决策 =====")
+    print(f"动作：{decision['action']}")
+    print(f"原因：{decision['reason']}")
+    print(f"详情：{decision['details']}")
+
+    # 把决策保存到当前轮次
+    round_record["decision"] = deepcopy(decision)
+
     # 记录修复前后的测试对比
     report["verification"]["comparison"] = comparison
+
+    # 保存解析后的测试结果和对比结果
+    round_record["verification"]["after_fix"] = deepcopy(
+        report["verification"]["after_fix"]
+    )
+    round_record["verification"]["comparison"] = deepcopy(comparison)
+
+    # 本轮流程均完成，不等同于所有测试都通过
+    round_record["status"] = "completed"
+
     save_checkpoint(report)
 
 
