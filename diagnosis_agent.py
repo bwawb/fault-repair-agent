@@ -14,9 +14,10 @@ from run_report import build_run_report, save_run_report
 from proposal import extract_latest_preview
 from apply_proposal import confirm_and_apply
 from tools.test_tools import TestTools
-from workspace import create_workspace
+from workspace import create_workspace,  create_baseline_snapshot
 from compare_test_reports import read_test_report, compare_results
 from repair_decision import decide_next_step
+from patch_summary import build_file_diff
 
 
 # SYSTEM_PROMPT = """
@@ -315,6 +316,9 @@ def main():
 
     print(f"工作副本：{working_project}")
 
+    baseline_project = create_baseline_snapshot(str(working_project))
+    print(f"基线快照：{baseline_project}")
+
     # 5. 初始化统一任务报告
     report = build_run_report(
         user_request=user_request,
@@ -329,6 +333,14 @@ def main():
     report["task"]["target_test_ids"] = target_test_ids
 
     report["rounds"] = []
+
+    # 记录任务开始时常见的快照位置
+    report["workspace"]["baseline_project"] = str(baseline_project)
+
+    # 按文件保存最近一次成功应用修改后的累计diff
+    report["patch_summary"] = {
+        "files": {},
+    }
 
     # 6. 首次保存报告
     report_path = save_checkpoint(report)
@@ -608,6 +620,49 @@ def main():
                 finish_report(report, final_status="application_error")
 
             return
+
+        print("\n===== 当前文件的累计修改 =====")
+
+        relative_path = proposal["relative_path"]
+
+        try:
+            cumulative_diff = build_file_diff(baseline_project=str(baseline_project),
+                                              working_project=str(working_project),
+                                              relative_path=proposal["relative_path"],
+                                              )
+        except (OSError, UnicodeError, ValueError) as exc:
+            print(f"生成累计diff失败：{exc}")
+
+            # 明确记录失败，避免把失败误认为“没有修改”。
+            patch_result = {
+                "status": "error",
+                "relative_path": relative_path,
+                "diff": None,
+                "message": str(exc),
+            }
+
+        else:
+            if cumulative_diff:
+                print(cumulative_diff)
+                status = "generated"
+            else:
+                print("当前文件与基线快照相比没有内容变化")
+                status = "unchanged"
+            patch_result = {
+                "status": status,
+                "relative_path": relative_path,
+                "diff": cumulative_diff,
+                "message": None,
+            }
+
+        # 顶层记录该文件最近一次应用修改后的累计结果。
+        report["patch_summary"]["files"][relative_path] = deepcopy(patch_result)
+
+        # 同时保存当前轮结束应用步骤时的结果。
+        round_record["cumulative_patch"] = deepcopy(patch_result)
+
+        # 在运行修复后测试之前保存。
+        save_checkpoint(report)
 
         verification_result = verify_round(
             test_tools=test_tools,

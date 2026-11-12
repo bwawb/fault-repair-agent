@@ -26,7 +26,7 @@ class FileTools:
         读取项目内的文本文件。
 
         Args:
-            relative_path: 相对于根据路的文件路径。
+            relative_path: 相对于根目录的文件路径。
 
         Return:
             文件内容，如果读取失败，返回错误信息。

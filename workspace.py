@@ -58,3 +58,39 @@ def create_workspace(
     )
 
     return working_project
+
+def create_baseline_snapshot(working_project: str) -> Path:
+    """
+    复制刚创建的工作副本，作为任务开始时的项目快照。
+
+    Args:
+        working_project:当前任务的工作副本目录
+
+    Returns:
+        基线快照的目录路径
+
+    Raises:
+        ValueError: 工作副本不存在或不是目录
+        FileExistsError: 基线快照目录已经存在
+    """
+    project_path = Path(working_project).resolve()
+    if not project_path.is_dir():
+        raise ValueError(
+            f"工作副本不存在或不是目录：{project_path}"
+        )
+
+    # 与 project 处于同一个任务目录中。
+    snapshot_path = project_path.parent / "baseline_project"
+
+    # 不覆盖已有快照，避免丢失最初状态。
+    if snapshot_path.exists():
+        raise FileExistsError(
+            f"基线快照已经存在：{snapshot_path}"
+        )
+
+    shutil.copytree(
+        project_path,
+        snapshot_path,
+    )
+
+    return snapshot_path
