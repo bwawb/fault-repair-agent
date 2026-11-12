@@ -50,6 +50,18 @@ def decide_next_step(
             "details": missing_tests,
         }
 
+    # 修复后出现了基线中没有的测试，先停止并报告
+    new_tests = sorted(set(after_results) - set(baseline_results))
+    if new_tests:
+        return {
+            "action": "stop",
+            "reason": "new_tests_detected",
+            "details": {
+                test_id: after_results[test_id]
+                for test_id in new_tests
+            },
+        }
+
     # 已通过的基线测试如果变成失败，属于新增失败
     newly_failed = sorted(
         test_id
@@ -181,3 +193,21 @@ if __name__ == "__main__":
         )
 
         print(f"{name}: {decision}")
+
+    print("==========出现新测试==========")
+    after_with_new_test = {
+        target: "passed",
+        existing_failure: "failed",
+        normal_test: "passed",
+        "test_new_case": "failed",
+    }
+
+    decision = decide_next_step(
+        target_test_ids=[target],
+        baseline_results=baseline,
+        after_results=after_with_new_test,
+        current_round=1,
+        max_rounds=3,
+    )
+
+    print("出现新测试：", decision)

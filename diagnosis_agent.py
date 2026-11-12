@@ -4,6 +4,7 @@ from langgraph.errors import GraphRecursionError
 from uuid import uuid4
 from datetime import datetime
 from copy import deepcopy
+import json
 
 
 from demo_tool_call import create_model
@@ -69,6 +70,219 @@ def finish_report(report, final_status):
     report["final_status"] = final_status
 
     return save_checkpoint(report)
+
+
+def run_diagnosis(agent, user_request: str) -> dict:
+    """
+    让Agent针对当前任务调用工具并分析结果。
+
+    Args:
+        agent: 已经创建好的Agent
+        user_request: 本轮需要分析的任务
+
+    Returns:
+        Agent返回的结果，包含本轮消息
+    """
+
+    return agent.invoke(
+        {
+            "messages": [
+                HumanMessage(content=user_request),
+            ]
+        },
+        config={
+            "recursion_limit": 20,
+        }
+    )
+
+
+def prepare_round_proposal(messages, report: dict, round_record: dict) -> dict:
+    """
+    从Agent消息中提取修改提案，并更新任务和当前轮次记录
+
+    returns:
+        extract_latest_preview()返回的结果
+    """
+    proposal_result = extract_latest_preview(messages)
+    if not proposal_result["success"]:
+        # 记录提案提取失败的原因
+        report["proposal"]["status"] = "extraction_failed"
+        report["proposal"]["message"] = proposal_result["message"]
+
+        round_record["proposal"] = deepcopy(report["proposal"])
+        round_record["status"] = "proposal_unavailable"
+
+        return proposal_result
+
+    proposal = proposal_result["proposal"]
+
+    report["proposal"] = {
+        "status": "generated",
+        "tool_call_id": proposal["tool_call_id"],
+        "relative_path": proposal["relative_path"],
+        "old_text": proposal["old_text"],
+        "new_text": proposal["new_text"],
+        "diff": proposal["diff"],
+    }
+
+    # 为当前轮次保存独立副本
+    round_record["proposal"] = deepcopy(report["proposal"])
+
+    return proposal_result
+
+
+def apply_round_proposal(
+        working_project,
+        proposal:dict,
+        report: dict,
+        round_record: dict,
+) -> dict:
+    """
+    等待用户确认，尝试应用本轮提案，并记录结果。
+
+    Args:
+        working_project: 本次任务的工作副本路径。
+        proposal: 当前轮次的修改提案。
+        report: 整个任务的报告。
+        round_record: 当前轮次的记录
+
+    Returns:
+        confirm_reply的返回结果
+    """
+
+    apply_result = confirm_and_apply(
+        project_path=str(working_project),
+        proposal=proposal,
+    )
+
+    # 记录用户是否同意
+    report["approval"] = {
+        "status": apply_result["approval_status"],
+    }
+
+    # 用户拒绝时，不尝试应用修改
+    if apply_result["status"] == "rejected":
+        report["application"] = {
+            "status": "not_attempted",
+            "message": apply_result["message"],
+        }
+    else:
+        report["application"] = {
+            "status": apply_result["status"],
+            "message": apply_result["message"],
+        }
+
+    # 保存到当前轮次
+    round_record["approval"] = deepcopy(report["approval"])
+    round_record["application"] = deepcopy(report["application"])
+
+    return apply_result
+
+def verify_round(
+        test_tools,
+        after_fix_path,
+        baseline_results: dict,
+        report: dict,
+        round_record: dict,
+) -> dict:
+    """
+    运行修复后测试，解析报告，并与最初基线比较
+
+    Returns:
+        成功：
+            {
+                "success": True,
+                "after_results": {…},
+                "comparison": {…},
+            }
+
+        失败：
+            {
+                "success": False,
+                "status": 结束原因,
+                "messages": 错误说明
+            }
+    """
+    print("\n===== 运行修复后测试 =====")
+
+    after_run = test_tools.run_tests_with_report(
+        report_path=str(after_fix_path)
+    )
+
+    print(f"运行状态：{after_run['status']}")
+    print(f"pytest 退出码：{after_run['exit_code']}")
+    print("测试输出：")
+    print(after_run["output"])
+
+    # 先记录测试进程信息
+    report["verification"]["after_fix"] = {
+        "status": after_run["status"],
+        "exit_code": after_run["exit_code"],
+        "output": after_run["output"],
+        "report_path": str(after_fix_path),
+        "test_results": None,
+    }
+
+    round_record["verification"] = {
+        "after_fix": deepcopy(report["verification"]["after_fix"]),
+        "comparison": None,
+    }
+
+    save_checkpoint(report)
+
+    # completed表示进程结束，退出码仍需要单独检查
+    if after_run["status"] != "completed" or after_run["exit_code"] not in (0, 1):
+        message = "修复后测试未正常完成，无法比较测试结果。"
+        round_record["status"] = "after_test_error"
+
+        return {
+            "success": False,
+            "status": "after_test_error",
+            "message": message,
+        }
+
+    try:
+        after_results = read_test_report(after_run["report_path"])
+    except (OSError, ValueError) as exc:
+        message = f"读取修复后测试报告失败：{exc}"
+
+        report["verification"]["after_fix"]["report_error"] = str(exc)
+        round_record["verification"]["after_fix"] = deepcopy(
+            report["verification"]["after_fix"]
+        )
+        round_record["status"] = "after_report_error"
+
+        return {
+            "success": False,
+            "status": "after_report_error",
+            "message": message,
+        }
+
+    # 记录每个测试的修复后状态
+    report["verification"]["after_fix"]["test_results"] = after_results
+    round_record["verification"]["after_fix"] = deepcopy(
+        report["verification"]["after_fix"]
+    )
+    save_checkpoint(report)
+
+    # 与任务开始时的基线比较
+    comparison = compare_results(
+        before=baseline_results,
+        after=after_results,
+    )
+
+    report["verification"]["comparison"] = comparison
+    round_record["verification"]["comparison"] = deepcopy(comparison)
+
+    # 先保存结果；轮次决策由主程序继续处理
+    save_checkpoint(report)
+
+    return {
+        "success": True,
+        "after_results": after_results,
+        "comparison": comparison,
+    }
+
 
 
 def main():
@@ -155,7 +369,7 @@ def main():
     # # 仅用于本次验证，验证后删除
     # baseline_run["status"] = "simulated_error"
 
-    if baseline_run["status"] != "completed":
+    if baseline_run["status"] != "completed" or baseline_run["exit_code"] not in (0, 1):
         print("修复前测试未正常完成，无法建立测试基线。")
         print(f"工作副本：{working_project}")
 
@@ -263,15 +477,9 @@ def main():
     print(f"用户任务：{user_request}")
 
     try:
-        result = agent.invoke(
-            {
-                "messages": [
-                    HumanMessage(content=user_request),
-                ]
-            },
-            config={
-                "recursion_limit": 20,
-            }
+        result = run_diagnosis(
+            agent=agent,
+            user_request=user_request
         )
     except GraphRecursionError:
         print("\nAgent 达到执行步数上限，分析未完成。")
@@ -316,39 +524,22 @@ def main():
 
     print("\n===== 提取修改提案 =====")
 
-    proposal_result = extract_latest_preview(result["messages"])
+    proposal_result = prepare_round_proposal(
+        messages=result["messages"],
+        report=report,
+        round_record=round_record
+    )
 
     if not proposal_result["success"]:
         print(proposal_result["message"])
-
-        # 记录为什么无法进入修改阶段
-        report["proposal"]["status"] = "extraction_failed"
-        report["proposal"]["message"] = proposal_result["message"]
-
-        round_record["proposal"] = deepcopy(report["proposal"])
-        round_record["status"] = "proposal_unavailable"
-
-        # 结束任务并保存报告
-        finish_report(report, final_status="proposal_unavaliable")
+        finish_report(report, final_status="proposal_unavailable")
         return
 
     proposal = proposal_result["proposal"]
 
-    # 将提取出的修改提案写入统一报告
-    report['proposal'] = {
-        "status": "generated",
-        "tool_call_id":proposal["tool_call_id"],
-        "relative_path":proposal["relative_path"],
-        "old_text": proposal["old_text"],
-        "new_text": proposal["new_text"],
-        "diff":proposal["diff"]
-    }
-
-    # 将本次提案保存到第一轮
-    round_record["proposal"] = deepcopy(report["proposal"])
-
-    # 保存当前进度
+    # 保存成功提取的提案
     save_checkpoint(report)
+
 
     print(f"工具调用 ID：{proposal['tool_call_id']}")
     print(f"目标文件：{proposal['relative_path']}")
@@ -364,30 +555,12 @@ def main():
 
     print("\n===== 确认并应用修改 =====")
 
-    apply_result = confirm_and_apply(
-        project_path=str(working_project),
+    apply_result = apply_round_proposal(
+        working_project=working_project,
         proposal=proposal,
+        report=report,
+        round_record=round_record
     )
-
-    # 记录用户是否同意应用修改
-    report["approval"] = {
-        "status": apply_result["approval_status"],
-    }
-
-    # 记录修改是否应用
-    if apply_result["status"] == "rejected":
-        report["application"] = {
-            "status": "not_attempted",
-            "message": apply_result["message"]
-        }
-    else:
-        report["application"] = {
-            "status": apply_result["status"],
-            "message": apply_result["message"],
-        }
-
-    round_record["approval"] = deepcopy(report["approval"])
-    round_record["application"] = deepcopy(report["application"])
 
     # 保存当前进度
     save_checkpoint(report)
@@ -408,70 +581,27 @@ def main():
 
         return
 
-    print("\n===== 运行修复后测试 =====")
-
-    after_run = test_tools.run_tests_with_report(
-        report_path=str(after_fix_path),
+    verification_result = verify_round(
+        test_tools=test_tools,
+        after_fix_path=after_fix_path,
+        baseline_results=baseline_results,
+        report=report,
+        round_record=round_record,
     )
 
-    print(f"运行状态：{after_run['status']}")
-    print(f"pytest 退出码：{after_run['exit_code']}")
-    print("测试输出：")
-    print(after_run["output"])
-
-    # 记录修复后的测试运行结果
-    report["verification"]["after_fix"] = {
-        "status": after_run["status"],
-        "exit_code": after_run["exit_code"],
-        "output": after_run["output"],
-        "report_path": str(after_fix_path),
-        "test_results": None,
-    }
-
-    # 先记录测试进程结果，后续解析成功后再更新
-    round_record["verification"] = {
-        "after_fix": deepcopy(report["verification"]["after_fix"]),
-        "comparison": None
-    }
-
-    save_checkpoint(report)
-
-    if after_run["status"] != "completed":
-        print("修复后测试未正常完成，无法比较测试结果。")
+    if not verification_result["success"]:
+        print(verification_result["message"])
         print(f"工作副本：{working_project}")
 
-        # 记录第一轮的结束原因
-        round_record["status"] = "after_test_error"
-
-        finish_report(report, final_status="after_test_error")
-        return
-
-    try:
-        after_results = read_test_report(after_run["report_path"])
-    except (OSError, ValueError) as exc:
-        print(f"读取修复后测试报告失败：{exc}")
-        print(f"工作副本：{working_project}")
-
-        report["verification"]["after_fix"]["report_error"] = str(exc)
-
-        # 同步当前轮次
-        round_record["verification"]["after_fix"] = deepcopy(
-            report["verification"]["after_fix"]
+        finish_report(
+            report,
+            final_status=verification_result["status"],
         )
-        round_record["status"] = "after_report_error"
 
-        finish_report(report, final_status="after_report_error")
         return
+    after_results = verification_result["after_results"]
+    comparison = verification_result["comparison"]
 
-    # 记录修复后每个测试用例的状态
-    report["verification"]["after_fix"]["test_results"] = after_results
-    save_checkpoint(report)
-
-    # 比较每个测试在修复前后的状态。
-    comparison = compare_results(
-        before=baseline_results,
-        after=after_results,
-    )
 
     # 目前仍是单轮流程，先固定为第一轮
     current_round = 1
