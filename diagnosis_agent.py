@@ -341,7 +341,7 @@ def main():
     report_dir = working_project.parent / "reports"
 
     baseline_path = report_dir / f"baseline_{run_id}.xml"
-    after_fix_path = report_dir / f"after_fix_{run_id}.xml"
+    # after_fix_path = report_dir / f"after_fix_{run_id}.xml"
 
     test_tools = TestTools(str(working_project))
     print("\n===== 运行修复前测试 =====")
@@ -433,22 +433,6 @@ def main():
     for test_id, status in target_baseline_results.items():
         print(f"  {test_id}: {status}")
 
-    # # 保存更新
-    # save_checkpoint(report)
-
-    # 开始第一轮修复
-    round_record = {
-        "round_number" : 1,
-        "status": "in_progress",
-        "agent": None,
-        "proposal": None,
-        "application": None,
-        "verification": None
-    }
-
-    report["rounds"].append(round_record)
-    save_checkpoint(report)
-
     # 1.创建模型
     model = create_model()
 
@@ -465,234 +449,291 @@ def main():
         system_prompt=SYSTEM_PROMPT
     )
 
-    # 5.提供需要分析的故障
-    user_request = (
-        "订单折扣计算存在问题。"
-        "请运行测试，找到折扣问题的相关代码，"
-        "分析故障原因，并生成最小修改的 diff 预览。"
-        "本次只处理订单折扣问题。"
-    )
-
-    print("===== 开始故障分析 =====")
-    print(f"用户任务：{user_request}")
-
-    try:
-        result = run_diagnosis(
-            agent=agent,
-            user_request=user_request
-        )
-    except GraphRecursionError:
-        print("\nAgent 达到执行步数上限，分析未完成。")
-        round_record["status"] = "agent_step_limit"
-        finish_report(report, final_status="agent_step_limit")
-        return
-
-    # 6. 查看 Agent 运行过程中产生的消息。
-    # print("\n===== Agent 执行过程 =====")
-    # for message in result["messages"]:
-    #     if isinstance(message, AIMessage) and message.tool_calls:
-    #         for tool_call in message.tool_calls:
-    #             print(f"\n模型请求工具：{tool_call['name']}")
-    #             print(f"工具参数：{tool_call['args']}")
-    #     elif isinstance(message, ToolMessage):
-    #         print(f"\n工具返回，tool_call_id：{message.tool_call_id}")
-    #         print(message.content)
-
-    # 7. 显示最终回答。
-    print("\n===== 最终故障分析 =====")
-    print(result["messages"][-1].content)
-
-    # 整理 Agent 本次运行的消息。
-    agent_report = build_run_report(
-        user_request=user_request,
-        messages=result["messages"],
-    )
-
-    # 只更新原有报告中的 Agent 信息。
-    report["agent"] = agent_report["agent"]
-
-    # 保存第一轮的Agent信息
-    round_record["agent"] = deepcopy(report["agent"])
-
-    # 使用原来的task_id保存信息
-    report_path = save_checkpoint(report)
-
-    # # 保存到原来的 JSON 文件。
-    # report_path = save_checkpoint(report)
-
-    print(f"任务报告已更新：{report_path}")
-
-    print("\n===== 提取修改提案 =====")
-
-    proposal_result = prepare_round_proposal(
-        messages=result["messages"],
-        report=report,
-        round_record=round_record
-    )
-
-    if not proposal_result["success"]:
-        print(proposal_result["message"])
-        finish_report(report, final_status="proposal_unavailable")
-        return
-
-    proposal = proposal_result["proposal"]
-
-    # 保存成功提取的提案
-    save_checkpoint(report)
-
-
-    print(f"工具调用 ID：{proposal['tool_call_id']}")
-    print(f"目标文件：{proposal['relative_path']}")
-
-    print("\n原文本：")
-    print(proposal["old_text"])
-
-    print("\n新文本：")
-    print(proposal["new_text"])
-
-    print("\n修改预览：")
-    print(proposal["diff"])
-
-    print("\n===== 确认并应用修改 =====")
-
-    apply_result = apply_round_proposal(
-        working_project=working_project,
-        proposal=proposal,
-        report=report,
-        round_record=round_record
-    )
-
-    # 保存当前进度
-    save_checkpoint(report)
-
-    print(f"修改状态：{apply_result['status']}")
-    print(f"说明：{apply_result['message']}")
-
-    # 放在return之前是因为用户取消或者应用失败时，程序会直接return提前结束
-    if apply_result["status"] != "applied":
-        print(f"\n本次工作副本保存在：{working_project}")
-
-        if apply_result["status"] == "rejected":
-            round_record["status"] = "cancelled"
-            finish_report(report, final_status="cancelled")
-        else:
-            round_record["status"] = "application_error"
-            finish_report(report, final_status="application_error")
-
-        return
-
-    verification_result = verify_round(
-        test_tools=test_tools,
-        after_fix_path=after_fix_path,
-        baseline_results=baseline_results,
-        report=report,
-        round_record=round_record,
-    )
-
-    if not verification_result["success"]:
-        print(verification_result["message"])
-        print(f"工作副本：{working_project}")
-
-        finish_report(
-            report,
-            final_status=verification_result["status"],
-        )
-
-        return
-    after_results = verification_result["after_results"]
-    comparison = verification_result["comparison"]
-
-
-    # 目前仍是单轮流程，先固定为第一轮
-    current_round = 1
+    # 多轮修复的最大轮数
     max_rounds = 3
 
-    decision = decide_next_step(
-        target_test_ids=target_test_ids,
-        baseline_results=baseline_results,
-        after_results=after_results,
-        current_round=current_round,
-        max_rounds=max_rounds,
-    )
+    # 第一轮使用原始用户任务
+    round_request = user_request
 
-    print("\n===== 下一步决策 =====")
-    print(f"动作：{decision['action']}")
-    print(f"原因：{decision['reason']}")
-    print(f"详情：{decision['details']}")
+    # 保存初始状态，用于每一轮开始时重置顶层字段
+    initial_agent = deepcopy(report["agent"])
+    initial_proposal = deepcopy(report["proposal"])
+    initial_approval = deepcopy(report["approval"])
+    initial_application = deepcopy(report["application"])
 
-    # 把决策保存到当前轮次
-    round_record["decision"] = deepcopy(decision)
-
-    # 记录修复前后的测试对比
-    report["verification"]["comparison"] = comparison
-
-    # 保存解析后的测试结果和对比结果
-    round_record["verification"]["after_fix"] = deepcopy(
-        report["verification"]["after_fix"]
-    )
-    round_record["verification"]["comparison"] = deepcopy(comparison)
-
-    # 本轮流程均完成，不等同于所有测试都通过
-    round_record["status"] = "completed"
-
-    save_checkpoint(report)
+    print(f"\n最多进行 {max_rounds} 轮修复。")
 
 
-    print("\n===== 修复前后测试结果对比 =====")
 
-    print("\n恢复通过：")
-    if comparison["fixed"]:
-        for test_id in comparison["fixed"]:
-            print(f"  {test_id}")
-    else:
-        print("  无")
+    for current_round in range(1, max_rounds + 1):
 
-    print("\n仍然失败：")
-    if comparison["still_failing"]:
-        for test_id in comparison["still_failing"]:
-            print(f"  {test_id}")
-    else:
-        print("  无")
+        print(f"\n========== 第 {current_round} 轮修复 ==========")
 
-    print("\n新增失败：")
-    if comparison["newly_failed"]:
-        for test_id in comparison["newly_failed"]:
-            print(f"  {test_id}")
-    else:
-        print("  无")
+        # 创建当前轮次的独立记录
+        round_record = {
+            "round_number" : current_round,
+            "status": "in_progress",
+            "agent": None,
+            "proposal": None,
+            "application": None,
+            "verification": None
+        }
 
-    print("\n状态无法直接比较：")
-    if comparison["uncertain"]:
-        for item in comparison["uncertain"]:
-            print(f"  {item}")
-    else:
-        print("  无")
+        # report["rounds"].append(round_record)
+        # save_checkpoint(report)
 
-    print("\n仅出现在修复前报告中：")
-    if comparison["only_before"]:
-        for test_id in comparison["only_before"]:
-            print(f"  {test_id}")
-    else:
-        print("  无")
+        report["rounds"].append(round_record)
 
-    print("\n仅出现在修复后报告中：")
-    if comparison["only_after"]:
-        for test_id in comparison["only_after"]:
-            print(f"  {test_id}")
-    else:
-        print("  无")
+        # 顶层字段表示当前轮次的数据
+        # 之前轮次的数据仍然保存在 report["rounds"] 中。
 
-    print(f"\n修复前报告：{baseline_path}")
-    print(f"修复后报告：{after_fix_path}")
-    print(f"工作副本：{working_project}")
+        report["agent"] = deepcopy(initial_agent)
+        report["proposal"] = deepcopy(initial_proposal)
+        report["approval"] = deepcopy(initial_approval)
+        report["application"] = deepcopy(initial_application)
 
-    # 正常完成测试对比后，更新任务的结束状态
-    report_path = finish_report(
+        report["verification"]["after_fix"] = None
+        report["verification"]["comparison"] = None
+
+        # 为当前轮次创建独立的测试报告路径
+        after_fix_path = (report_dir/ f"after_fix_{run_id}_round_{current_round}.xml")
+
+        save_checkpoint(report)
+
+
+        print("===== 开始故障分析 =====")
+        print(f"本轮任务：{round_request}")
+
+        try:
+            result = run_diagnosis(
+                agent=agent,
+                user_request=round_request
+            )
+        except GraphRecursionError:
+            print("\nAgent 达到执行步数上限，分析未完成。")
+            round_record["status"] = "agent_step_limit"
+            finish_report(report, final_status="agent_step_limit")
+            return
+
+        # 6. 查看 Agent 运行过程中产生的消息。
+        # print("\n===== Agent 执行过程 =====")
+        # for message in result["messages"]:
+        #     if isinstance(message, AIMessage) and message.tool_calls:
+        #         for tool_call in message.tool_calls:
+        #             print(f"\n模型请求工具：{tool_call['name']}")
+        #             print(f"工具参数：{tool_call['args']}")
+        #     elif isinstance(message, ToolMessage):
+        #         print(f"\n工具返回，tool_call_id：{message.tool_call_id}")
+        #         print(message.content)
+
+        # 7. 显示最终回答。
+        print("\n===== 最终故障分析 =====")
+        print(result["messages"][-1].content)
+
+        # 整理 Agent 本次运行的消息。
+        agent_report = build_run_report(
+            user_request=round_request,
+            messages=result["messages"],
+        )
+
+        # 只更新原有报告中的 Agent 信息。
+        report["agent"] = agent_report["agent"]
+
+        # 保存第一轮的Agent信息
+        round_record["agent"] = deepcopy(report["agent"])
+
+        # 使用原来的task_id保存信息
+        report_path = save_checkpoint(report)
+
+        # # 保存到原来的 JSON 文件。
+        # report_path = save_checkpoint(report)
+
+        print(f"任务报告已更新：{report_path}")
+
+        print("\n===== 提取修改提案 =====")
+
+        proposal_result = prepare_round_proposal(
+            messages=result["messages"],
+            report=report,
+            round_record=round_record
+        )
+
+        if not proposal_result["success"]:
+            print(proposal_result["message"])
+            finish_report(report, final_status="proposal_unavailable")
+            return
+
+        proposal = proposal_result["proposal"]
+
+        # 保存成功提取的提案
+        save_checkpoint(report)
+
+
+        print(f"工具调用 ID：{proposal['tool_call_id']}")
+        print(f"目标文件：{proposal['relative_path']}")
+
+        print("\n原文本：")
+        print(proposal["old_text"])
+
+        print("\n新文本：")
+        print(proposal["new_text"])
+
+        print("\n修改预览：")
+        print(proposal["diff"])
+
+        print("\n===== 确认并应用修改 =====")
+
+        apply_result = apply_round_proposal(
+            working_project=working_project,
+            proposal=proposal,
+            report=report,
+            round_record=round_record
+        )
+
+        # 保存当前进度
+        save_checkpoint(report)
+
+        print(f"修改状态：{apply_result['status']}")
+        print(f"说明：{apply_result['message']}")
+
+        # 放在return之前是因为用户取消或者应用失败时，程序会直接return提前结束
+        if apply_result["status"] != "applied":
+            print(f"\n本次工作副本保存在：{working_project}")
+
+            if apply_result["status"] == "rejected":
+                round_record["status"] = "cancelled"
+                finish_report(report, final_status="cancelled")
+            else:
+                round_record["status"] = "application_error"
+                finish_report(report, final_status="application_error")
+
+            return
+
+        verification_result = verify_round(
+            test_tools=test_tools,
+            after_fix_path=after_fix_path,
+            baseline_results=baseline_results,
+            report=report,
+            round_record=round_record,
+        )
+
+        if not verification_result["success"]:
+            print(verification_result["message"])
+            print(f"工作副本：{working_project}")
+
+            finish_report(
+                report,
+                final_status=verification_result["status"],
+            )
+
+            return
+        after_results = verification_result["after_results"]
+        comparison = verification_result["comparison"]
+
+        # 根据当前轮结果决定停止还是重试
+        decision = decide_next_step(
+            target_test_ids=target_test_ids,
+            baseline_results=baseline_results,
+            after_results=after_results,
+            current_round=current_round,
+            max_rounds=max_rounds,
+        )
+
+        print("\n===== 本轮测试结果对比 =====")
+        print(f"恢复通过：{comparison['fixed']}")
+        print(f"仍然失败：{comparison['still_failing']}")
+        print(f"新增失败：{comparison['newly_failed']}")
+        print(f"状态无法直接比较：{comparison['uncertain']}")
+        print(f"仅出现在修复前：{comparison['only_before']}")
+        print(f"仅出现在修复后：{comparison['only_after']}")
+
+        print("\n===== 下一步决策 =====")
+        print(f"动作：{decision['action']}")
+        print(f"原因：{decision['reason']}")
+        print(f"详情：{decision['details']}")
+
+        # 保存当前轮决策
+        round_record["decision"] = deepcopy(decision)
+
+        # 本轮流程执行完毕；不代表所有测试都通过。
+        round_record["status"] = "completed"
+
+        save_checkpoint(report)
+
+        # 如果决策为 stop，结束整个任务。
+        if decision["action"] == "stop":
+
+            if decision["reason"] == "targets_passed":
+                final_status = "completed"
+            else:
+                # 例如 regression、round_limit_reached。
+                final_status = decision["reason"]
+
+            report_path = finish_report(
+                report,
+                final_status=final_status,
+            )
+
+            print(f"\n任务结束：{final_status}")
+            print(f"修复前报告：{baseline_path}")
+            print(f"本轮修复后报告：{after_fix_path}")
+            print(f"工作副本：{working_project}")
+            print(f"最终任务报告：{report_path}")
+
+            return
+
+        # 防止未知决策动作被误认为 retry。
+        if decision["action"] != "retry":
+            round_record["status"] = "invalid_decision"
+
+            finish_report(
+                report,
+                final_status="invalid_decision",
+            )
+
+            print(f"\n无法识别的决策动作：{decision['action']}")
+            return
+
+        # 只有 decision["action"] == "retry" 才会执行到这里。
+        # 将当前轮结果提供给下一轮 Agent。
+        feedback = {
+            "previous_round": current_round,
+            "target_test_ids": target_test_ids,
+            "previous_change": {
+                "relative_path": proposal["relative_path"],
+                "diff": proposal["diff"],
+            },
+            "test_results": after_results,
+            "comparison_with_baseline": comparison,
+            "decision": decision,
+            "test_output": report["verification"]["after_fix"]["output"],
+        }
+
+        round_request = (
+            f"{user_request}\n\n"
+            f"这是第 {current_round + 1} 轮修复。\n"
+            "上一轮的修改已经应用到当前工作副本，"
+            "但目标测试仍然失败。\n"
+            "请结合上一轮结果重新分析。\n"
+            "生成新提案前，请重新读取当前工作副本中的相关文件。\n"
+            "继续只处理原任务指定的目标。\n\n"
+            "上一轮结果：\n"
+            f"{json.dumps(feedback, ensure_ascii=False, indent=2)}"
+        )
+
+        print(
+            f"\n目标测试仍未通过，"
+            f"准备进入第 {current_round + 1} 轮。"
+        )
+
+    # 这里在 for 循环外、main() 内。
+    # 正常情况下，最后一轮应返回 stop。
+    finish_report(
         report,
-        final_status="completed"
+        final_status="loop_ended_unexpectedly",
     )
 
-    print(f"最终报任务报告：{report_path}")
+    print("\n修复循环异常结束，请检查轮次决策。")
 
 
     # print("\n===== 运行记录 =====")
