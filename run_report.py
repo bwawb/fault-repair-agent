@@ -1,4 +1,5 @@
 import json
+from tempfile import NamedTemporaryFile
 from datetime import datetime
 from pathlib import Path
 from uuid import uuid4
@@ -12,7 +13,8 @@ def build_run_report(
         task_id: str = None,
         source_project: str = None,
         working_project: str = None,
-        started_at: str = None
+        started_at: str = None,
+        baseline_project: str | None = None,
 ) -> dict:
     """
     构建统一运行任务。
@@ -24,6 +26,7 @@ def build_run_report(
         source_project: 原项目路径
         working_project: 工作副本路径
         started_at: 任务开始时间
+        baseline_project: 修复前的代码快照路径
 
     Return:
         完成的任务报告字典
@@ -76,6 +79,7 @@ def build_run_report(
         "workspace": {
             "source_project": source_project,
             "working_project": working_project,
+            "baseline_project": baseline_project,
         },
 
         "agent": {
@@ -110,6 +114,12 @@ def build_run_report(
             "comparison": None,
         },
 
+        "patch_summary": {
+            "files": {},
+        },
+
+        "rollbacks": [],
+
         "final_status": "in_progress",
     }
 
@@ -129,12 +139,19 @@ def save_run_report(
 
     report_path = output_path / f"task_{task_id}.json"
 
-    with report_path.open("w", encoding="utf-8") as file:
-        json.dump(
-            report,
-            file,
-            ensure_ascii=False,
-            indent=2,
-        )
-
+    write_run_report(report, report_path)
     return report_path
+
+
+def write_run_report(report: dict, report_path: Path) -> None:
+    """先写临时文件，再替换原报告，避免写入中断时留下半份 JSON。"""
+    temporary_file = NamedTemporaryFile(
+        mode="w", encoding="utf-8", dir=report_path.parent, delete=False
+    )
+    temporary_path = Path(temporary_file.name)
+    try:
+        with temporary_file as file:
+            json.dump(report, file, ensure_ascii=False, indent=2)
+        temporary_path.replace(report_path)
+    finally:
+        temporary_path.unlink(missing_ok=True)

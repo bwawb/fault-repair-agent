@@ -1,226 +1,176 @@
 import hashlib
+from contextlib import ExitStack
 from pathlib import Path
+from stat import S_IMODE
+from tempfile import TemporaryDirectory
 
-from tools.edit_tools import EditTools
+from tools.edit_tools import PreparedFile, prepare_file_changes, resolve_edit_target
 
 
 def sha256_bytes(content: bytes) -> str:
-    """计算字节内容的SHA256-摘要"""
+    """计算文件字节的 SHA-256。"""
     return hashlib.sha256(content).hexdigest()
 
-def confirm_and_apply(project_path: str, proposal: dict, ) -> dict:
-    """
-    展示提案，等待人工确认，并应用单文件文本替换。
 
-    当前学习版本只支持单行 old_text 和 new_text。
+def _read_current(project_root: Path, file: PreparedFile) -> bytes:
+    if project_root.resolve(strict=True) != project_root:
+        raise ValueError("工作副本目录已重定向。")
+    if resolve_edit_target(project_root, file.requested_path) != file.path:
+        raise ValueError("文件路径发生变化，请重新预览。")
+    return file.path.read_bytes()
 
-    Args:
-        project_path: 工作副本的项目根目录。
-        proposal: 从Agent消息中提取的修改提案。
 
-    Returns:
-        应用结果
-    """
+def _check_current(project_root: Path, file: PreparedFile, expected_hash: str) -> None:
+    if sha256_bytes(_read_current(project_root, file)) != expected_hash:
+        raise ValueError("文件在确认期间发生变化或已被外部修改，请重新预览。")
 
-    project_root = Path(project_path).resolve()
 
-    # 初始状态：还没有询问用户
+def _replace_file(staged: Path, target: Path) -> None:
+    staged.replace(target)
+
+
+def _write_files(project_root: Path, prepared: list[PreparedFile], results: list[dict]) -> str:
+    """准备所有临时文件、复核所有目标，再逐个替换。失败时逆序恢复。"""
+    entries = list(zip(prepared, results))
+    with ExitStack() as stack:
+        staged_files = []
+        for file, result in entries:
+            try:
+                _check_current(project_root, file, result["before_hash"])
+                directory = Path(stack.enter_context(
+                    TemporaryDirectory(dir=file.path.parent, ignore_cleanup_errors=True)
+                ))
+                original = directory / "original"
+                modified = directory / "modified"
+                mode = S_IMODE(file.path.stat().st_mode)
+                for path, content in ((original, file.original), (modified, file.modified)):
+                    path.write_bytes(content)
+                    path.chmod(mode)
+                staged_files.append((original, modified))
+            except (OSError, ValueError, RuntimeError) as exc:
+                result.update(status="precheck_failed", message=str(exc))
+                return "error"
+
+        # 在第一次替换前复核所有文件，包括较早暂存的文件。
+        for file, result in entries:
+            try:
+                _check_current(project_root, file, result["before_hash"])
+            except (OSError, ValueError, RuntimeError) as exc:
+                result.update(status="precheck_failed", message=str(exc))
+                return "error"
+
+        written = []
+        for (file, result), (original, modified) in zip(entries, staged_files):
+            try:
+                _check_current(project_root, file, result["before_hash"])
+                _replace_file(modified, file.path)
+            except (OSError, ValueError, RuntimeError) as exc:
+                result.update(status="write_failed", message=str(exc))
+                break
+            result.update(status="applied", after_hash=sha256_bytes(file.modified))
+            written.append((file, result, original))
+        else:
+            return "applied"
+
+        recovery_failed = False
+        for file, result, original in reversed(written):
+            try:
+                _check_current(project_root, file, result["after_hash"])
+                _replace_file(original, file.path)
+            except (OSError, ValueError, RuntimeError) as exc:
+                result.update(status="restore_failed", message=str(exc), current_hash=None)
+                try:
+                    result["current_hash"] = sha256_bytes(_read_current(project_root, file))
+                except (OSError, ValueError, RuntimeError):
+                    pass
+                recovery_failed = True
+            else:
+                result.update(status="restored", current_hash=result["before_hash"])
+
+        if recovery_failed:
+            return "partial"
+        return "write_failed_restored" if written else "write_failed"
+
+
+def confirm_and_apply(project_path: str, proposal: dict) -> dict:
+    """一次确认并应用所有文件的变更，同时支持旧的单文件提案。"""
     approval_status = "not_requested"
+    results = []
 
-    # 获取Agent调用工具的传入的参数内容
-    relative_path = proposal.get("relative_path")
-    old_text = proposal.get("old_text")
-    new_text = proposal.get("new_text")
-    original_diff = proposal.get("diff")
-
-    # 1.检查填内容
-    if not isinstance(relative_path, str) or not relative_path.strip():
+    def outcome(status: str, message: str) -> dict:
+        for result in results:
+            if result["status"] == "prepared":
+                result["status"] = "not_attempted"
         return {
-            "status": "error",
-            "message": "提案缺少有效的目标文件路径。",
-            "approval_status": approval_status,
-        }
-
-    if not isinstance(old_text, str) or not old_text:
-        return {
-            "status": "error",
-            "message": "提案缺少有效的原文本。",
-            "approval_status": approval_status,
-        }
-
-    if not isinstance(new_text, str):
-        return {
-            "status": "error",
-            "message": "提案的新文本必须是字符串。",
-            "approval_status": approval_status,
-        }
-
-    if not isinstance(original_diff, str) or not original_diff:
-        return {
-            "status": "error",
-            "message": "提案缺少有效的 diff。",
-            "approval_status": approval_status,
-        }
-
-    # 当前版本先限定为单行替换，便于和字节匹配保持一致。
-    if any(char in old_text or char in new_text for char in ("\n", "\r")):
-        return {
-            "status": "error",
-            "message": "当前版本只支持单行文本替换。",
-            "approval_status": approval_status,
-        }
-
-    requested_path = Path(relative_path)
-
-    if requested_path.is_absolute():
-        return {
-            "status": "error",
-            "message": "目标路径必须相对于工作目录。",
-            "approval_status": approval_status,
-        }
-
-    target_path = (project_root / requested_path).resolve()
-
-    # 2. 检查目标文件是否位于工作目录。
-    if not target_path.is_relative_to(project_root):
-        return {
-            "status": "error",
-            "message": "不允许修改工作目录之外的文件。",
-            "approval_status": approval_status,
-        }
-
-
-    # 当前阶段不修改测试文件。
-    relative_parts = target_path.relative_to(project_root).parts
-
-    if "tests" in relative_parts:
-        return {
-            "status": "error",
-            "message": "当前阶段不允许修改 tests 目录中的文件。",
-            "approval_status": approval_status,
-        }
-
-    if not target_path.is_file():
-        return {
-            "status": "error",
-            "message": f"目标文件不存在：{relative_path}",
-            "approval_status": approval_status,
+            "status": status, "message": message,
+            "approval_status": approval_status, "files": results,
         }
 
     try:
-        # 3. 在重新预览前记录文件内容。
-        before_preview = target_path.read_bytes()
-        before_preview_hash = sha256_bytes(before_preview)
+        project_root = Path(project_path).resolve()
+        if "files" in proposal and Path(project_path).absolute() != project_root:
+            raise ValueError("多文件提案必须使用本次任务工作副本的实际目录。")
+        if not project_root.is_dir() or project_root.resolve(strict=True) != project_root:
+            raise ValueError("工作副本目录不存在或已重定向。")
 
-        # 4. 在同一个工作副本中重新生成预览。
-        edit_tools = EditTools(str(project_root))
+        original_diff = proposal.get("diff")
+        if not isinstance(original_diff, str) or not original_diff:
+            raise ValueError("提案缺少有效的 diff。")
 
-        preview = edit_tools.preview_replace(
-            relative_path=relative_path,
-            old_text=old_text,
-            new_text=new_text,
-        )
+        single_file_fields = {"relative_path", "replacements", "old_text", "new_text"}
+        if "files" in proposal:
+            if single_file_fields.intersection(proposal):
+                raise ValueError("files 不能与顶层单文件字段一起使用。")
+            files = proposal["files"]
+        else:
+            if "replacements" in proposal and {"old_text", "new_text"}.intersection(proposal):
+                raise ValueError("提案不能同时提供 replacements 和顶层 old_text 或 new_text。")
+            files = [{
+                "relative_path": proposal.get("relative_path"),
+                "replacements": proposal.get("replacements", [{
+                    "old_text": proposal.get("old_text"), "new_text": proposal.get("new_text"),
+                }]),
+            }]
 
-        if not preview["success"]:
-            return {
-                "status": "error",
-                "message": f"重新预览失败：{preview['message']}",
-                "approval_status": approval_status,
-            }
+        prepared = prepare_file_changes(project_root, files, results)
+        for file, result in zip(prepared, results):
+            result["before_hash"] = sha256_bytes(file.original)
+            try:
+                _check_current(project_root, file, result["before_hash"])
+            except (OSError, ValueError, RuntimeError) as exc:
+                result.update(status="precheck_failed", message=str(exc))
+                raise
 
-        # 确认预览期间文件没有变化。
-        after_preview = target_path.read_bytes()
+        diff = "".join(file.diff for file in prepared)
+        if diff != original_diff:
+            raise ValueError("当前 diff 与 Agent 的原始预览不一致，请重新分析。")
 
-
-
-        if sha256_bytes(after_preview) != before_preview_hash:
-            return {
-                "status": "error",
-                "message": "文件在生成预览时发生变化，请重新分析。",
-                "approval_status": approval_status,
-            }
-
-        # 确认重新生成的 diff 与 Agent 提案中的 diff 一致。
-        if preview["diff"] != original_diff:
-            return {
-                "status": "error",
-                "message": "当前 diff 与 Agent 的原始预览不一致，请重新分析。",
-                "approval_status": approval_status,
-            }
-
-        # 5. 展示本次实际准备应用的 diff。
         print("\n===== 待确认的修改 =====")
-        print(preview["diff"])
-
-        decision = input(
-            "\n是否将上述修改应用到工作副本？"
-            "输入 yes 确认，其他内容取消："
-        ).strip().lower()
-
+        print(diff)
+        decision = input("是否将上述修改应用到工作副本？输入 yes 确认，其他内容取消：").strip().lower()
         if decision != "yes":
-            approval_status="rejected"
-
-
-            return {
-                "status": "rejected",
-                "message": "用户取消了修改。",
-                "approval_status": approval_status,
-            }
+            approval_status = "rejected"
+            return outcome("rejected", "用户取消了修改。")
         approval_status = "approved"
 
-        # 6. 确认后再次检查文件版本。
-        current_bytes = target_path.read_bytes()
+        status = _write_files(project_root, prepared, results)
+        if status == "applied":
+            result = outcome(status, "修改已应用到工作副本。")
+            result["diff"] = diff
+            if len(prepared) == 1:
+                result.update(
+                    file_path=str(prepared[0].path),
+                    before_hash=results[0]["before_hash"],
+                    after_hash=results[0]["after_hash"],
+                )
+            return result
 
-        if sha256_bytes(current_bytes) != before_preview_hash:
-            return {
-                "status": "error",
-                "message": "文件在确认期间发生变化，请重新预览。",
-                "approval_status": approval_status,
-            }
-
-        old_bytes = old_text.encode("utf-8")
-        new_bytes = new_text.encode("utf-8")
-
-        match_count = current_bytes.count(old_bytes)
-
-        if match_count != 1:
-            return {
-                "status": "error",
-                "message": (
-                    f"原文本出现 {match_count} 次，"
-                    "无法确定唯一修改位置。"
-                ),
-                "approval_status": approval_status,
-            }
-
-        # 7. 替换并写入工作副本。
-        modified_bytes = current_bytes.replace(
-            old_bytes,
-            new_bytes,
-            1,
-        )
-
-        target_path.write_bytes(modified_bytes)
-
-        return {
-            "status": "applied",
-            "message": "修改已应用到工作副本。",
-            "file_path": str(target_path),
-            "before_hash": before_preview_hash,
-            "after_hash": sha256_bytes(modified_bytes),
-            "diff": preview["diff"],
-            "approval_status": approval_status,
-        }
-
-
-
-
-    except (OSError, UnicodeError) as exc:
-
-        return {
-
-            "status": "error",
-            "message": f"处理修改时发生错误：{exc}",
-            "approval_status": approval_status,
-
-        }
+        failure = next(item for item in results if item["status"] in {"precheck_failed", "write_failed"})
+        message = f'{failure["relative_path"]}：{failure["message"]}'
+        if status == "partial":
+            message += " 已有文件恢复失败，工作副本可能处于部分应用状态。"
+        elif status == "write_failed_restored":
+            message += " 本轮已经写入的文件均已恢复到应用前的内容。"
+        return outcome(status, message)
+    except (OSError, ValueError, RuntimeError, EOFError) as exc:
+        return outcome("error", f"处理修改时发生错误：{exc}")

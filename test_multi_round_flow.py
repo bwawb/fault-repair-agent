@@ -90,6 +90,7 @@ def test_retry_then_target_passes(monkeypatch, tmp_path):
         source_project=None,
         working_project=None,
         started_at=None,
+        baseline_project=None,
     ):
         agent_data = {
             "model_message_count": 1 if messages else 0,
@@ -112,7 +113,9 @@ def test_retry_then_target_passes(monkeypatch, tmp_path):
                 "workspace": {
                     "source_project": source_project,
                     "working_project": working_project,
+                    "baseline_project": baseline_project,
                 },
+                "patch_summary": {"files": {}},
                 "agent": agent_data,
                 "proposal": {
                     "status": "not_generated",
@@ -246,6 +249,8 @@ def test_retry_then_target_passes(monkeypatch, tmp_path):
 
         return {
             "status": "applied",
+            "file_path": str(working_project / proposal["relative_path"]),
+            "after_hash": "0" * 64,
             "approval_status": "approved",
             "message": "模拟用户同意并应用修改",
         }
@@ -444,6 +449,7 @@ def test_stops_when_round_limit_is_reached(monkeypatch, tmp_path):
         source_project=None,
         working_project=None,
         started_at=None,
+        baseline_project=None,
     ):
         agent_data = {
             "model_message_count": 1 if messages else 0,
@@ -466,7 +472,9 @@ def test_stops_when_round_limit_is_reached(monkeypatch, tmp_path):
                 "workspace": {
                     "source_project": source_project,
                     "working_project": working_project,
+                    "baseline_project": baseline_project,
                 },
+                "patch_summary": {"files": {}},
                 "agent": agent_data,
                 "proposal": {
                     "status": "not_generated",
@@ -600,6 +608,8 @@ def test_stops_when_round_limit_is_reached(monkeypatch, tmp_path):
 
         return {
             "status": "applied",
+            "file_path": str(working_project / proposal["relative_path"]),
+            "after_hash": "0" * 64,
             "approval_status": "approved",
             "message": "模拟用户同意并应用修改",
         }

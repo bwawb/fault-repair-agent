@@ -16,7 +16,7 @@ def test_reject_second_round_proposal(monkeypatch, tmp_path):
         真正应用修改，但目标测试仍然失败。
 
     第 2 轮：
-        在同一个工作副本上再次修改，目标测试通过。
+        拒绝下一次提案，保留第一轮已应用的修改和累计 diff。
 
     测试中不调用真实模型，
     但会真实应用补丁、执行 pytest、生成并解析 XML 报告。
@@ -281,6 +281,14 @@ def test_reject_second_round_proposal(monkeypatch, tmp_path):
     # 第二轮拒绝，不应应用修改。
     assert second_round["approval"]["status"] == "rejected"
     assert second_round["application"]["status"] == "not_attempted"
+
+    first_patch = first_round["cumulative_patch"]
+    assert first_patch["status"] == "generated"
+    assert first_patch["relative_path"] == "pricing.py"
+    assert "-    discount_rate = discount_percent // 100\n" in first_patch["diff"]
+    assert "+    discount_rate = discount_percent // 50\n" in first_patch["diff"]
+    assert "cumulative_patch" not in second_round
+    assert report["patch_summary"]["files"] == {"pricing.py": first_patch}
 
     # =========================================================
     # 11. 验证第二轮没有执行修复后测试

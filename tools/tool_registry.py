@@ -24,6 +24,8 @@ class ToolRegistry:
             "run_tests": self.test_tools.run_tests,
             "search_code": self.file_tools.search_code,
             "preview_replace": self.edit_tools.preview_replace,
+            "preview_replacements": self.edit_tools.preview_replacements,
+            "preview_file_changes": self.edit_tools.preview_file_changes,
         }
 
         # 每个工具允许接收的参数
@@ -36,7 +38,9 @@ class ToolRegistry:
                 "relative_path",
                 "old_text",
                 "new_text",
-            }
+            },
+            "preview_replacements": {"relative_path", "replacements"},
+            "preview_file_changes": {"files"},
         }
 
     def execute(self, tool_name: str, arguments: dict) -> dict:
@@ -99,18 +103,18 @@ class ToolRegistry:
                     "result": "search_code 需要非空字符串参数 query。",
                 }
 
-        if tool_name == "preview_replace":
+        if tool_name in {"preview_replace", "preview_replacements"}:
             relative_path = arguments.get("relative_path")
-            old_text = arguments.get("old_text")
-            new_text = arguments.get("new_text")
-
             if not isinstance(relative_path, str) or not relative_path.strip():
                 return {
                     "success": False,
                     "tool_name": tool_name,
-                    "result": "preview_replace 需要非空的 relative_path。",
+                    "result": f"{tool_name} 需要非空的 relative_path。",
                 }
 
+        if tool_name == "preview_replace":
+            old_text = arguments.get("old_text")
+            new_text = arguments.get("new_text")
             if not isinstance(old_text, str) or not old_text:
                 return {
                     "success": False,

@@ -1,6 +1,9 @@
 import json
+from copy import deepcopy
 
 from langchain_core.messages import AIMessage, ToolMessage
+
+from tools.edit_tools import validate_file_changes, validate_replacements
 
 def extract_latest_preview(messages: list) -> dict:
     """
@@ -16,19 +19,19 @@ def extract_latest_preview(messages: list) -> dict:
     """
     latest_call = None
 
-    # 第一步：找到模型最后一次提出的preview_replace调用
+    # 第一步：找到模型最后一次调用的修改预览工具。
     for message in messages:
         if not isinstance(message, AIMessage):
             continue
 
         for tool_call in message.tool_calls:
-            if tool_call.get("name") == "preview_replace":
+            if tool_call.get("name") in {"preview_replace", "preview_replacements", "preview_file_changes"}:
                 latest_call = tool_call
 
     if latest_call is None:
         return {
             "success": False,
-            "message": "模型没有调用 preview_replace，无法提取修改提案。",
+            "message": "模型没有调用修改预览工具，无法提取修改提案。",
             "proposal": None,
         }
 
@@ -106,6 +109,7 @@ def extract_latest_preview(messages: list) -> dict:
                 f"{preview_result.get('message', '没有提供错误详情')}"
             ),
             "proposal": None,
+            "files": preview_result.get("files", []),
         }
 
     diff = preview_result.get("diff")
@@ -126,22 +130,30 @@ def extract_latest_preview(messages: list) -> dict:
             "proposal": None,
         }
 
-    required_keys = ("relative_path", "old_text", "new_text")
-
-    if any(not isinstance(args.get(key), str) for key in required_keys):
-        return {
-            "success": False,
-            "message": "修改提案缺少必要的字符串参数。",
-            "proposal": None,
-        }
-
     proposal = {
         "tool_call_id": tool_call_id,
-        "relative_path": args["relative_path"],
-        "old_text": args["old_text"],
-        "new_text": args["new_text"],
         "diff": diff,
     }
+    try:
+        if latest_call["name"] == "preview_file_changes":
+            files = args.get("files")
+            validate_file_changes(files)
+            proposal["files"] = deepcopy(files)
+        elif latest_call["name"] == "preview_replacements":
+            replacements = args.get("replacements")
+            validate_replacements(replacements)
+            proposal["replacements"] = [replacement.copy() for replacement in replacements]
+        else:
+            replacement = {key: args.get(key) for key in ("old_text", "new_text")}
+            validate_replacements([replacement])
+            proposal.update(replacement)
+        if "files" not in proposal:
+            relative_path = args.get("relative_path")
+            if not isinstance(relative_path, str) or not relative_path.strip():
+                raise ValueError("修改提案缺少有效的文件路径。")
+            proposal["relative_path"] = relative_path
+    except ValueError as exc:
+        return {"success": False, "message": str(exc), "proposal": None}
 
     return {
         "success": True,

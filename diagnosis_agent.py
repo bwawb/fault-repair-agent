@@ -4,6 +4,7 @@ from langgraph.errors import GraphRecursionError
 from uuid import uuid4
 from datetime import datetime
 from copy import deepcopy
+from pathlib import Path
 import json
 
 
@@ -14,7 +15,7 @@ from run_report import build_run_report, save_run_report
 from proposal import extract_latest_preview
 from apply_proposal import confirm_and_apply
 from tools.test_tools import TestTools
-from workspace import create_workspace,  create_baseline_snapshot
+from workspace import create_workspace, create_baseline_snapshot
 from compare_test_reports import read_test_report, compare_results
 from repair_decision import decide_next_step
 from patch_summary import build_file_diff
@@ -45,9 +46,9 @@ SYSTEM_PROMPT = """
 2. 根据需要运行测试、搜索代码并读取相关文件。
 3. 区分测试预期行为和代码实际行为。
 4. 在提出修改前，先读取待修改文件。
-5. 使用 preview_replace 生成修改预览。
+5. 单处替换使用 preview_replace，同一文件的多处替换使用 preview_replacements，多个文件使用 preview_file_changes。
 6. 最终回答应包含故障位置、原因、证据、修改预览和不确定之处。
-7. preview_replace 只生成预览，不会修改文件。
+7. 预览工具只生成预览，不会修改文件。
 8. 不要声称修改已经应用，也不要声称修改后的测试已经通过。
 """
 
@@ -109,6 +110,13 @@ def prepare_round_proposal(messages, report: dict, round_record: dict) -> dict:
         # 记录提案提取失败的原因
         report["proposal"]["status"] = "extraction_failed"
         report["proposal"]["message"] = proposal_result["message"]
+        if "files" in proposal_result:
+            files = deepcopy(proposal_result["files"])
+            for file in files:
+                if file["status"] == "prepared":
+                    file["status"] = "not_attempted"
+            report["application"].update(files=files, message=proposal_result["message"])
+            round_record["application"] = deepcopy(report["application"])
 
         round_record["proposal"] = deepcopy(report["proposal"])
         round_record["status"] = "proposal_unavailable"
@@ -117,14 +125,7 @@ def prepare_round_proposal(messages, report: dict, round_record: dict) -> dict:
 
     proposal = proposal_result["proposal"]
 
-    report["proposal"] = {
-        "status": "generated",
-        "tool_call_id": proposal["tool_call_id"],
-        "relative_path": proposal["relative_path"],
-        "old_text": proposal["old_text"],
-        "new_text": proposal["new_text"],
-        "diff": proposal["diff"],
-    }
+    report["proposal"] = {"status": "generated", **deepcopy(proposal)}
 
     # 为当前轮次保存独立副本
     round_record["proposal"] = deepcopy(report["proposal"])
@@ -173,11 +174,52 @@ def apply_round_proposal(
             "message": apply_result["message"],
         }
 
+    if "files" in apply_result:
+        report["application"]["files"] = deepcopy(apply_result["files"])
+
     # 保存到当前轮次
     round_record["approval"] = deepcopy(report["approval"])
     round_record["application"] = deepcopy(report["application"])
 
     return apply_result
+
+
+def record_cumulative_patches(working_project, baseline_project, apply_result, report, round_record):
+    files = apply_result.get("files")
+    if files is None:
+        # 兼容只返回单文件路径和哈希的调用结果。
+        files = [{
+            "relative_path": Path(apply_result["file_path"]).relative_to(working_project).as_posix(),
+            "status": "applied",
+            "after_hash": apply_result["after_hash"],
+        }]
+
+    patches = {}
+    for file in files:
+        if file["status"] not in {"applied", "restore_failed"}:
+            continue
+        relative_path = file["relative_path"]
+        file_hash = file["after_hash"]
+        try:
+            if file["status"] == "restore_failed" and file["current_hash"] != file_hash:
+                file_hash = None
+                raise ValueError("恢复失败后无法确认文件仍是本轮写入的版本。")
+            diff = build_file_diff(str(baseline_project), str(working_project), relative_path)
+        except (OSError, ValueError, RuntimeError) as exc:
+            print(f"{relative_path} 生成累计 diff 失败：{exc}")
+            patch = {"status": "error", "diff": None, "message": str(exc)}
+        else:
+            print(diff or f"{relative_path} 与基线快照相比没有内容变化。")
+            patch = {"status": "generated" if diff else "unchanged", "diff": diff, "message": None}
+
+        patch.update(relative_path=relative_path, file_hash=file_hash)
+        report["patch_summary"]["files"][relative_path] = deepcopy(patch)
+        patches[relative_path] = patch
+
+    if "files" in round_record["proposal"]:
+        round_record["cumulative_patches"] = patches
+    elif patches:
+        round_record["cumulative_patch"] = next(iter(patches.values()))
 
 def verify_round(
         test_tools,
@@ -327,20 +369,13 @@ def main():
         source_project=source_project,
         working_project=str(working_project),
         started_at=started_at,
+        baseline_project=str(baseline_project),
     )
 
     # 即使后续步骤失败，也能在报告中看到本次的修复目标
     report["task"]["target_test_ids"] = target_test_ids
 
     report["rounds"] = []
-
-    # 记录任务开始时常见的快照位置
-    report["workspace"]["baseline_project"] = str(baseline_project)
-
-    # 按文件保存最近一次成功应用修改后的累计diff
-    report["patch_summary"] = {
-        "files": {},
-    }
 
     # 6. 首次保存报告
     report_path = save_checkpoint(report)
@@ -582,16 +617,9 @@ def main():
 
 
         print(f"工具调用 ID：{proposal['tool_call_id']}")
-        print(f"目标文件：{proposal['relative_path']}")
-
-        print("\n原文本：")
-        print(proposal["old_text"])
-
-        print("\n新文本：")
-        print(proposal["new_text"])
-
-        print("\n修改预览：")
-        print(proposal["diff"])
+        target_files = proposal.get("files", [proposal])
+        target_paths = [file["relative_path"] for file in target_files]
+        print("目标文件：" + "、".join(target_paths))
 
         print("\n===== 确认并应用修改 =====")
 
@@ -602,13 +630,15 @@ def main():
             round_record=round_record
         )
 
-        # 保存当前进度
-        save_checkpoint(report)
-
         print(f"修改状态：{apply_result['status']}")
         print(f"说明：{apply_result['message']}")
 
-        # 放在return之前是因为用户取消或者应用失败时，程序会直接return提前结束
+        if apply_result["status"] in {"applied", "partial"}:
+            print("\n===== 当前文件的累计修改 =====")
+            record_cumulative_patches(
+                working_project, baseline_project, apply_result, report, round_record
+            )
+
         if apply_result["status"] != "applied":
             print(f"\n本次工作副本保存在：{working_project}")
 
@@ -616,50 +646,13 @@ def main():
                 round_record["status"] = "cancelled"
                 finish_report(report, final_status="cancelled")
             else:
-                round_record["status"] = "application_error"
-                finish_report(report, final_status="application_error")
+                final_status = (
+                    "application_partial" if apply_result["status"] == "partial" else "application_error"
+                )
+                round_record["status"] = final_status
+                finish_report(report, final_status=final_status)
 
             return
-
-        print("\n===== 当前文件的累计修改 =====")
-
-        relative_path = proposal["relative_path"]
-
-        try:
-            cumulative_diff = build_file_diff(baseline_project=str(baseline_project),
-                                              working_project=str(working_project),
-                                              relative_path=proposal["relative_path"],
-                                              )
-        except (OSError, UnicodeError, ValueError) as exc:
-            print(f"生成累计diff失败：{exc}")
-
-            # 明确记录失败，避免把失败误认为“没有修改”。
-            patch_result = {
-                "status": "error",
-                "relative_path": relative_path,
-                "diff": None,
-                "message": str(exc),
-            }
-
-        else:
-            if cumulative_diff:
-                print(cumulative_diff)
-                status = "generated"
-            else:
-                print("当前文件与基线快照相比没有内容变化")
-                status = "unchanged"
-            patch_result = {
-                "status": status,
-                "relative_path": relative_path,
-                "diff": cumulative_diff,
-                "message": None,
-            }
-
-        # 顶层记录该文件最近一次应用修改后的累计结果。
-        report["patch_summary"]["files"][relative_path] = deepcopy(patch_result)
-
-        # 同时保存当前轮结束应用步骤时的结果。
-        round_record["cumulative_patch"] = deepcopy(patch_result)
 
         # 在运行修复后测试之前保存。
         save_checkpoint(report)
@@ -754,9 +747,9 @@ def main():
         feedback = {
             "previous_round": current_round,
             "target_test_ids": target_test_ids,
-            "previous_change": {
-                "relative_path": proposal["relative_path"],
-                "diff": proposal["diff"],
+            "previous_change": {"relative_paths": target_paths, "diff": proposal["diff"]}
+            if "files" in proposal else {
+                "relative_path": proposal["relative_path"], "diff": proposal["diff"],
             },
             "test_results": after_results,
             "comparison_with_baseline": comparison,

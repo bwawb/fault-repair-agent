@@ -2,6 +2,7 @@ import json
 
 from langchain_core.tools import tool
 
+from tools.edit_tools import FileChange, TextReplacement
 from tools.tool_registry import ToolRegistry
 
 
@@ -78,8 +79,8 @@ def create_langchain_tools(registry: ToolRegistry) -> list:
         预览对项目中文本文件的一次替换，不会修改文件。
 
         relative_path 是相对于项目根目录的文件路径。
-        old_text 必须与文件中的原文完全一致，且只出现一次。
-        new_text 是建议替换后的内容。
+        old_text 和 new_text 都可以包含多行。old_text 必须唯一匹配原文。
+        多行文本可用 LF 或 CRLF，替换时采用文件原有的换行风格。
 
         工具返回修改前后的 diff，供检查。
         """
@@ -93,10 +94,37 @@ def create_langchain_tools(registry: ToolRegistry) -> list:
         )
         return json.dumps(result, ensure_ascii=False)
 
+    @tool
+    def preview_replacements(relative_path: str, replacements: list[TextReplacement]) -> str:
+        """
+        预览同一个已有文件中的多处替换，返回一份统一 diff。
+
+        relative_path 是相对于项目根目录的文件路径。
+        replacements 是非空列表，每项包含可为多行的 old_text 和 new_text。
+        每个 old_text 都必须在原始文件中唯一匹配，各匹配范围不能重叠。
+        """
+        result = registry.execute(
+            tool_name="preview_replacements",
+            arguments={"relative_path": relative_path, "replacements": replacements},
+        )
+        return json.dumps(result, ensure_ascii=False)
+
+    @tool
+    def preview_file_changes(files: list[FileChange]) -> str:
+        """预览同一个工作副本中多个已有文件的修改，返回一份统一 diff。
+
+        files 中每项包含 relative_path 和 replacements。每个文件只能出现一次。
+        每项替换包含可为多行的 old_text 和 new_text，匹配范围不能重叠。
+        """
+        result = registry.execute("preview_file_changes", {"files": files})
+        return json.dumps(result, ensure_ascii=False)
+
     return [
         list_files,
         read_file,
         run_tests,
         search_code,
         preview_replace,
+        preview_replacements,
+        preview_file_changes,
     ]
