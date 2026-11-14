@@ -6,6 +6,17 @@ from tools.edit_tools import FileChange, TextReplacement
 from tools.tool_registry import ToolRegistry
 
 
+class ToolResultSerializationError(ValueError):
+    """工具返回了无法编码成 JSON 的结果。"""
+
+
+def _encode_result(result: dict) -> str:
+    try:
+        return json.dumps(result, ensure_ascii=False)
+    except (TypeError, ValueError, RecursionError):
+        raise ToolResultSerializationError("工具结果无法编码为 JSON。") from None
+
+
 def create_langchain_tools(registry: ToolRegistry) -> list:
     """
     将现有的ToolRegistry包装成LangChain工具
@@ -24,7 +35,7 @@ def create_langchain_tools(registry: ToolRegistry) -> list:
             tool_name='list_files',
             arguments={}
         )
-        return json.dumps(result, ensure_ascii=False)
+        return _encode_result(result)
 
     @tool
     def read_file(relative_path: str) -> str:
@@ -41,20 +52,20 @@ def create_langchain_tools(registry: ToolRegistry) -> list:
             }
         )
 
-        return json.dumps(result, ensure_ascii=False)
+        return _encode_result(result)
 
     @tool
     def run_tests() -> str:
         """
         运行分析项目tests目录中的pytest测试
 
-        返回测试运行状态、退出码和测试输出。
+        使用当前任务选择的后端，返回运行状态、退出码、限量输出和错误原因。
         """
         result = registry.execute(
             tool_name="run_tests",
             arguments={},
         )
-        return json.dumps(result, ensure_ascii=False)
+        return _encode_result(result)
 
     @tool
     def search_code(query: str) -> str:
@@ -71,7 +82,7 @@ def create_langchain_tools(registry: ToolRegistry) -> list:
             },
         )
 
-        return json.dumps(result, ensure_ascii=False)
+        return _encode_result(result)
 
     @tool
     def preview_replace(relative_path: str, old_text: str, new_text: str,) -> str:
@@ -92,7 +103,7 @@ def create_langchain_tools(registry: ToolRegistry) -> list:
                 "new_text": new_text,
             },
         )
-        return json.dumps(result, ensure_ascii=False)
+        return _encode_result(result)
 
     @tool
     def preview_replacements(relative_path: str, replacements: list[TextReplacement]) -> str:
@@ -107,7 +118,7 @@ def create_langchain_tools(registry: ToolRegistry) -> list:
             tool_name="preview_replacements",
             arguments={"relative_path": relative_path, "replacements": replacements},
         )
-        return json.dumps(result, ensure_ascii=False)
+        return _encode_result(result)
 
     @tool
     def preview_file_changes(files: list[FileChange]) -> str:
@@ -117,7 +128,7 @@ def create_langchain_tools(registry: ToolRegistry) -> list:
         每项替换包含可为多行的 old_text 和 new_text，匹配范围不能重叠。
         """
         result = registry.execute("preview_file_changes", {"files": files})
-        return json.dumps(result, ensure_ascii=False)
+        return _encode_result(result)
 
     return [
         list_files,

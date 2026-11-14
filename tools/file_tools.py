@@ -1,12 +1,13 @@
-import os
+import stat
 from pathlib import Path
-from pydoc import resolve
+
+from file_access import DEFAULT_FILE_ACCESS, FileAccessDenied, FileAccessPolicy
 
 
 class FileTools:
     """在指定项目目录内执行文件读取操作"""
 
-    def __init__(self, project_path: str):
+    def __init__(self, project_path: str, *, policy: FileAccessPolicy = DEFAULT_FILE_ACCESS):
         """
         初始化文件工具
 
@@ -14,6 +15,7 @@ class FileTools:
             project_path: 待分析项目的根目录
         """
         self.project_path = Path(project_path).resolve()
+        self.policy = policy
 
         if not self.project_path.exists():
             raise ValueError(f"项目路径不存在：{self.project_path}")
@@ -33,23 +35,7 @@ class FileTools:
         """
 
         try:
-            requested_path = Path(relative_path)
-
-            if requested_path.is_absolute():
-                return "读取失败：请使用相对于根目录的路径"
-
-            file_path = (self.project_path/requested_path).resolve()
-
-            # 检查解析后的路径是否仍位于项目根目录内
-            if not file_path.is_relative_to(self.project_path):
-                return "读取失败：不允许访问项目目录之外的文件"
-
-            if not file_path.exists():
-                return f"读取失败：文件不存在：{relative_path}"
-
-            if not file_path.is_file():
-                return f"读取失败：目标不是问缉拿：{relative_path}"
-
+            file_path = self.policy.resolve_file(self.project_path, relative_path)
             content = file_path.read_text(encoding="utf-8")
 
             return (
@@ -59,8 +45,38 @@ class FileTools:
             )
         except UnicodeError:
             return f"读取失败：文件不是可用UTF-8解码的文本文件：{relative_path}"
-        except OSError as exc:
+        except FileNotFoundError:
+            return f"读取失败：文件不存在：{relative_path}"
+        except (OSError, ValueError, RuntimeError) as exc:
             return f"读取失败：{exc}"
+
+    def _walk_files(self, *, hide_idea: bool = False):
+        """逐级检查后再入栈，遇到被拒绝或不可检查的条目返回 None。"""
+        directories = [Path()]
+        while directories:
+            relative_dir = directories.pop()
+            try:
+                if relative_dir.parts:
+                    self.policy.inspect(self.project_path, relative_dir)
+                elif self.project_path.resolve(strict=True) != self.project_path:
+                    raise FileAccessDenied("工作目录已重定向。")
+                children = sorted((self.project_path / relative_dir).iterdir())
+            except (OSError, ValueError, RuntimeError):
+                yield None
+                continue
+            for child in children:
+                if hide_idea and child.name.casefold() == ".idea":
+                    continue
+                relative = child.relative_to(self.project_path)
+                try:
+                    resolved, info = self.policy.inspect(self.project_path, relative)
+                except (OSError, ValueError, RuntimeError):
+                    yield None
+                    continue
+                if stat.S_ISDIR(info.st_mode):
+                    directories.append(relative)
+                else:
+                    yield relative, resolved, info
 
     def list_files(self) -> str:
         """
@@ -70,39 +86,17 @@ class FileTools:
             项目文件的相对路径列表，或相应的错误信息。
         """
 
-        # 通常不需要agent读取
-        excluded_dirs = (
-            ".git",
-            ".venv",
-            "__pycache__",
-            ".pytest_cache",
-            ".idea"
-        )
-
         files = []
-
-        try:
-            for file_path in self.project_path.rglob("*"):
-                # 跳过目录，只保留文件
-                if not file_path.is_file():
-                    continue
-
-                # 得到相对于项目根目录的路径
-                relative_path = file_path.relative_to(self.project_path)
-
-                # 如果路径中包含需要排除的目录，就跳过
-                if any(part in excluded_dirs for part in relative_path.parts):
-                    continue
-
-                # 使用统一的/分隔符，便于后续交给read_file
-                files.append(relative_path.as_posix())
-            if not files:
-                return "项目中没有找到文件"
-            files.sort()
-
-            return "项目文件列表：\n" + "\n".join(files)
-        except OSError as exc:
-            return f"列出文件失败：{exc}"
+        skipped = 0
+        for entry in self._walk_files(hide_idea=True):
+            if entry is None:
+                skipped += 1
+            else:
+                files.append(entry[0].as_posix())
+        message = "项目文件列表：\n" + "\n".join(sorted(files)) if files else "项目中没有找到文件"
+        if skipped:
+            message += f"\n已跳过 {skipped} 个受保护、不安全或不可访问的条目。"
+        return message
 
 
     def search_code(self, query: str) -> str:
@@ -121,77 +115,45 @@ class FileTools:
         if not query:
             return "搜索失败：关键词不能为空"
 
-        excluded_dirs = {
-            ".git",
-            ".venv",
-            "__pycache__",
-            ".pytest_cache",
-        }
-
         max_results = 30
         max_file_bytes = 1_000_000
 
         results = []
         skipped_files = 0
 
-        try:
-            # followlinks=False,不沿着符号链接进入其他目录
-            for root, dirs, files in os.walk(self.project_path, followlinks=False):
-                # 在遍历时直接跳过不需要的目录。
-                dirs[:] = [
-                    name for name in dirs if name not in excluded_dirs
-                ]
+        needle = query.casefold()
+        for entry in self._walk_files():
+            if entry is None:
+                skipped_files += 1
+                continue
+            relative_path, resolved_path, info = entry
+            if relative_path.suffix != ".py":
+                continue
+            if info.st_size > max_file_bytes:
+                skipped_files += 1
+                continue
+            try:
+                content = resolved_path.read_text(encoding="utf-8")
+            except (OSError, UnicodeError):
+                skipped_files += 1
+                continue
+            for line_number, line in enumerate(content.splitlines(), start=1):
+                if needle in line.casefold():
+                    results.append(f"{relative_path.as_posix()}:{line_number}: {line.strip()[:300]}")
+                    if len(results) == max_results:
+                        break
+            if len(results) == max_results:
+                break
 
-                for file_name in sorted(files):
-                    # 第一版只搜索Python文件。
-                    if not file_name.endswith(".py"):
-                        continue
-
-                    file_path = Path(root) / file_name
-
-                    try:
-                        resolved_path = file_path.resolve()
-
-                        # 不读取指向项目外部的文件
-                        if not resolved_path.is_relative_to(self.project_path):
-                            continue
-
-                        # 跳过过大的文件，控制本阶段的读取范围
-                        if resolved_path.stat().st_size > max_file_bytes:
-                            skipped_files += 1
-                            continue
-
-                        content = resolved_path.read_text(encoding="utf-8")
-
-                    except(OSError, UnicodeError):
-                        # 单个文件无法读取时，不中断整个搜索。
-                        skipped_files += 1
-                        continue
-
-                    relative_path = file_path.relative_to(self.project_path).as_posix()
-
-                    for line_number, line in enumerate(content.splitlines(), start=1):
-                        # 使用普通字符串匹配，不区分大小写。
-                        if query.casefold() in line.casefold():
-                            display_line = line.strip()[:300]
-
-                            results.append(f"{relative_path}:{line_number}: {display_line}")
-                            if len(results) >= max_results:
-                                return (
-                                "搜索结果（达到 30 条上限，可能还有更多）：\n"
-                                + "\n".join(results)
-                                )
-
-        except OSError as exc:
-            return f"搜索失败：{exc}"
-
-        if not results:
+        if len(results) == max_results:
+            message = "搜索结果（达到 30 条上限，可能还有更多）：\n" + "\n".join(results)
+        elif not results:
             message = f"没有找到包含关键词 '{query}' 的结果。"
         else:
             message = "搜索结果：\n" + "\n".join(results)
 
         if skipped_files:
-            message += f"\n\n有 {skipped_files} 个文件过大或无法读取，已跳过。"
+            message += f"\n\n已跳过 {skipped_files} 个受保护、不安全、过大或不可读取的条目。"
 
         return message
 

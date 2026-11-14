@@ -7,6 +7,7 @@ from stat import S_IMODE
 from tempfile import NamedTemporaryFile
 
 from apply_proposal import sha256_bytes
+from output_protection import OutputProtectionError, current_output, emit, protect_output
 from run_report import write_run_report
 
 
@@ -93,10 +94,29 @@ def _read_finished_report(report_path: Path) -> dict:
     return report
 
 
-def rollback_file(report_path: str | Path, relative_path: str) -> dict:
+def rollback_file(report_path: str | Path, relative_path: str, *, sensitive_values=()) -> dict:
     """显式恢复已结束任务中的一个文件，并更新指定的任务报告。"""
+    with protect_output(sensitive_values) as protection:
+        try:
+            result = _rollback_file(report_path, relative_path)
+        except (OSError, ValueError, RuntimeError) as exc:
+            if not protection.enabled or isinstance(exc, OutputProtectionError):
+                raise
+            raise ValueError(protection.display(exc)) from None
+        if protection.enabled and result["reason"]:
+            return {**result, "reason": protection.display(result["reason"])}
+        return result
+
+
+def _rollback_file(report_path: str | Path, relative_path: str) -> dict:
+    protection = current_output()
+    protection.require_exact(report_path, relative_path)
     report_path = Path(report_path).resolve(strict=True)
-    _read_finished_report(report_path)
+    protection.require_exact(report_path)
+    original_report = _read_finished_report(report_path)
+    if original_report.get("output_protection", {}).get("known_values_redacted") and not protection.enabled:
+        raise ValueError("此报告启用了脱敏，请通过 rollback_file(..., sensitive_values=...) 重新提供本次任务的配置。")
+    protection.report_copy(original_report)
 
     # 同一任务的回滚串行进行，避免两个进程覆盖彼此的报告记录。
     lock_path = report_path.with_name(report_path.name + ".rollback.lock")
@@ -108,6 +128,9 @@ def rollback_file(report_path: str | Path, relative_path: str) -> dict:
 
     try:
         report = _read_finished_report(report_path)
+        if report.get("output_protection", {}).get("known_values_redacted") and not protection.enabled:
+            raise ValueError("此报告启用了脱敏，回滚需要重新提供本次任务的配置。")
+        protection.report_copy(report)
         history = report.setdefault("rollbacks", [])
         result = {
             "relative_path": relative_path,
@@ -135,6 +158,7 @@ def rollback_file(report_path: str | Path, relative_path: str) -> dict:
                 raise ValueError("工作副本文件与上次记录的 SHA-256 不符，已保留当前内容。")
             baseline_contents = baseline_file.read_bytes()
             baseline_hash = sha256_bytes(baseline_contents)
+            protection.require_exact(project_path, working_file, baseline_file, baseline_hash)
             changed = previous_contents != baseline_contents
             if changed:
                 _replace_working_file(working_file, baseline_contents, expected_hash)
@@ -179,7 +203,7 @@ def main() -> int:
         result = rollback_file(args.report_path, args.relative_path)
     except (OSError, ValueError, RuntimeError) as exc:
         parser.exit(1, f"回滚失败：{exc}\n")
-    print(json.dumps(result, ensure_ascii=False))
+    emit(json.dumps(result, ensure_ascii=False))
     return int(result["status"] == "error")
 
 

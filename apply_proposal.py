@@ -4,6 +4,8 @@ from pathlib import Path
 from stat import S_IMODE
 from tempfile import TemporaryDirectory
 
+from file_access import DEFAULT_FILE_ACCESS, FileAccessPolicy
+from output_protection import OutputProtectionError, current_output, emit
 from tools.edit_tools import PreparedFile, prepare_file_changes, resolve_edit_target
 
 
@@ -12,16 +14,14 @@ def sha256_bytes(content: bytes) -> str:
     return hashlib.sha256(content).hexdigest()
 
 
-def _read_current(project_root: Path, file: PreparedFile) -> bytes:
-    if project_root.resolve(strict=True) != project_root:
-        raise ValueError("工作副本目录已重定向。")
-    if resolve_edit_target(project_root, file.requested_path) != file.path:
+def _read_current(project_root: Path, file: PreparedFile, policy: FileAccessPolicy) -> bytes:
+    if resolve_edit_target(project_root, file.requested_path, policy=policy) != file.path:
         raise ValueError("文件路径发生变化，请重新预览。")
     return file.path.read_bytes()
 
 
-def _check_current(project_root: Path, file: PreparedFile, expected_hash: str) -> None:
-    if sha256_bytes(_read_current(project_root, file)) != expected_hash:
+def _check_current(project_root: Path, file: PreparedFile, expected_hash: str, policy: FileAccessPolicy) -> None:
+    if sha256_bytes(_read_current(project_root, file, policy)) != expected_hash:
         raise ValueError("文件在确认期间发生变化或已被外部修改，请重新预览。")
 
 
@@ -29,14 +29,16 @@ def _replace_file(staged: Path, target: Path) -> None:
     staged.replace(target)
 
 
-def _write_files(project_root: Path, prepared: list[PreparedFile], results: list[dict]) -> str:
+def _write_files(
+    project_root: Path, prepared: list[PreparedFile], results: list[dict], policy: FileAccessPolicy
+) -> str:
     """准备所有临时文件、复核所有目标，再逐个替换。失败时逆序恢复。"""
     entries = list(zip(prepared, results))
     with ExitStack() as stack:
         staged_files = []
         for file, result in entries:
             try:
-                _check_current(project_root, file, result["before_hash"])
+                _check_current(project_root, file, result["before_hash"], policy)
                 directory = Path(stack.enter_context(
                     TemporaryDirectory(dir=file.path.parent, ignore_cleanup_errors=True)
                 ))
@@ -54,7 +56,7 @@ def _write_files(project_root: Path, prepared: list[PreparedFile], results: list
         # 在第一次替换前复核所有文件，包括较早暂存的文件。
         for file, result in entries:
             try:
-                _check_current(project_root, file, result["before_hash"])
+                _check_current(project_root, file, result["before_hash"], policy)
             except (OSError, ValueError, RuntimeError) as exc:
                 result.update(status="precheck_failed", message=str(exc))
                 return "error"
@@ -62,7 +64,7 @@ def _write_files(project_root: Path, prepared: list[PreparedFile], results: list
         written = []
         for (file, result), (original, modified) in zip(entries, staged_files):
             try:
-                _check_current(project_root, file, result["before_hash"])
+                _check_current(project_root, file, result["before_hash"], policy)
                 _replace_file(modified, file.path)
             except (OSError, ValueError, RuntimeError) as exc:
                 result.update(status="write_failed", message=str(exc))
@@ -75,12 +77,12 @@ def _write_files(project_root: Path, prepared: list[PreparedFile], results: list
         recovery_failed = False
         for file, result, original in reversed(written):
             try:
-                _check_current(project_root, file, result["after_hash"])
+                _check_current(project_root, file, result["after_hash"], policy)
                 _replace_file(original, file.path)
             except (OSError, ValueError, RuntimeError) as exc:
                 result.update(status="restore_failed", message=str(exc), current_hash=None)
                 try:
-                    result["current_hash"] = sha256_bytes(_read_current(project_root, file))
+                    result["current_hash"] = sha256_bytes(_read_current(project_root, file, policy))
                 except (OSError, ValueError, RuntimeError):
                     pass
                 recovery_failed = True
@@ -92,7 +94,9 @@ def _write_files(project_root: Path, prepared: list[PreparedFile], results: list
         return "write_failed_restored" if written else "write_failed"
 
 
-def confirm_and_apply(project_path: str, proposal: dict) -> dict:
+def confirm_and_apply(
+    project_path: str, proposal: dict, *, policy: FileAccessPolicy = DEFAULT_FILE_ACCESS
+) -> dict:
     """一次确认并应用所有文件的变更，同时支持旧的单文件提案。"""
     approval_status = "not_requested"
     results = []
@@ -132,11 +136,11 @@ def confirm_and_apply(project_path: str, proposal: dict) -> dict:
                 }]),
             }]
 
-        prepared = prepare_file_changes(project_root, files, results)
+        prepared = prepare_file_changes(project_root, files, results, policy=policy)
         for file, result in zip(prepared, results):
             result["before_hash"] = sha256_bytes(file.original)
             try:
-                _check_current(project_root, file, result["before_hash"])
+                _check_current(project_root, file, result["before_hash"], policy)
             except (OSError, ValueError, RuntimeError) as exc:
                 result.update(status="precheck_failed", message=str(exc))
                 raise
@@ -145,7 +149,21 @@ def confirm_and_apply(project_path: str, proposal: dict) -> dict:
         if diff != original_diff:
             raise ValueError("当前 diff 与 Agent 的原始预览不一致，请重新分析。")
 
-        print("\n===== 待确认的修改 =====")
+        protection = current_output()
+        if protection.enabled:
+            try:
+                for file, result in zip(prepared, results):
+                    protection.require_exact(
+                        result["relative_path"], file.path, result["before_hash"],
+                        sha256_bytes(file.modified),
+                    )
+                displayed_diff = protection.display(diff)
+            except OutputProtectionError as exc:
+                return outcome("approval_blocked", str(exc))
+            if displayed_diff != diff:
+                return outcome("approval_blocked", "审批 diff 无法完整展示，已停止确认和应用。")
+
+        emit("\n===== 待确认的修改 =====")
         print(diff)
         decision = input("是否将上述修改应用到工作副本？输入 yes 确认，其他内容取消：").strip().lower()
         if decision != "yes":
@@ -153,7 +171,7 @@ def confirm_and_apply(project_path: str, proposal: dict) -> dict:
             return outcome("rejected", "用户取消了修改。")
         approval_status = "approved"
 
-        status = _write_files(project_root, prepared, results)
+        status = _write_files(project_root, prepared, results, policy)
         if status == "applied":
             result = outcome(status, "修改已应用到工作副本。")
             result["diff"] = diff

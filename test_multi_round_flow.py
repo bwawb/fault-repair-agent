@@ -55,28 +55,24 @@ def test_retry_then_target_passes(monkeypatch, tmp_path):
     # --------------------------------------------------
 
     class FakeTestTools:
-        def __init__(self, project_path):
+        def __init__(self, project_path, **kwargs):
             self.project_path = project_path
 
         def run_tests_with_report(self, report_path):
             # 这里模拟修复前测试结果。
             return {
-                "status": "completed",
+                "status": "failed",
                 "exit_code": 1,
                 "output": "模拟：目标测试失败",
                 "report_path": report_path,
+                "test_results": deepcopy(baseline),
+                "error": None,
             }
 
     monkeypatch.setattr(
         diagnosis_agent,
         "TestTools",
         FakeTestTools,
-    )
-
-    monkeypatch.setattr(
-        diagnosis_agent,
-        "read_test_report",
-        lambda report_path: deepcopy(baseline),
     )
 
     # --------------------------------------------------
@@ -169,7 +165,7 @@ def test_retry_then_target_passes(monkeypatch, tmp_path):
     monkeypatch.setattr(
         diagnosis_agent,
         "ToolRegistry",
-        lambda project_path: object(),
+        lambda project_path, **kwargs: object(),
     )
 
     monkeypatch.setattr(
@@ -414,28 +410,24 @@ def test_stops_when_round_limit_is_reached(monkeypatch, tmp_path):
     # --------------------------------------------------
 
     class FakeTestTools:
-        def __init__(self, project_path):
+        def __init__(self, project_path, **kwargs):
             self.project_path = project_path
 
         def run_tests_with_report(self, report_path):
             # 这里模拟修复前测试结果。
             return {
-                "status": "completed",
+                "status": "failed",
                 "exit_code": 1,
                 "output": "模拟：目标测试失败",
                 "report_path": report_path,
+                "test_results": deepcopy(baseline),
+                "error": None,
             }
 
     monkeypatch.setattr(
         diagnosis_agent,
         "TestTools",
         FakeTestTools,
-    )
-
-    monkeypatch.setattr(
-        diagnosis_agent,
-        "read_test_report",
-        lambda report_path: deepcopy(baseline),
     )
 
     # --------------------------------------------------
@@ -528,7 +520,7 @@ def test_stops_when_round_limit_is_reached(monkeypatch, tmp_path):
     monkeypatch.setattr(
         diagnosis_agent,
         "ToolRegistry",
-        lambda project_path: object(),
+        lambda project_path, **kwargs: object(),
     )
 
     monkeypatch.setattr(

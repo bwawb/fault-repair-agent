@@ -1,11 +1,36 @@
+import logging
 import shutil
 import tempfile
 from pathlib import Path
+
+from file_access import DEFAULT_FILE_ACCESS, FileAccessDenied, FileAccessPolicy
+
+
+def _copy_project(source: Path, destination: Path, policy: FileAccessPolicy) -> None:
+    skipped = 0
+
+    def ignore(directory, names):
+        nonlocal skipped
+        excluded = []
+        for name in names:
+            relative_path = (Path(directory) / name).relative_to(source)
+            try:
+                policy.inspect(source, relative_path)
+            except FileAccessDenied:
+                excluded.append(name)
+        skipped += len(excluded)
+        return excluded
+
+    shutil.copytree(source, destination, ignore=ignore, symlinks=True)
+    if skipped:
+        logging.getLogger(__name__).warning("复制项目时，文件访问策略跳过了 %d 个文件或目录。", skipped)
 
 
 def create_workspace(
     source_project: str,
     workspace_base: str,
+    *,
+    policy: FileAccessPolicy = DEFAULT_FILE_ACCESS,
 ) -> Path:
     """
     将示例项目复制到用户指定的工作目录。
@@ -46,20 +71,13 @@ def create_workspace(
     working_project = workspace_root / "project"
 
     # 将原项目复制到任务目录。
-    shutil.copytree(
-        source_path,
-        working_project,
-        ignore=shutil.ignore_patterns(
-            ".git",
-            ".venv",
-            "__pycache__",
-            ".pytest_cache",
-        ),
-    )
+    _copy_project(source_path, working_project, policy)
 
     return working_project
 
-def create_baseline_snapshot(working_project: str) -> Path:
+def create_baseline_snapshot(
+    working_project: str, *, policy: FileAccessPolicy = DEFAULT_FILE_ACCESS
+) -> Path:
     """
     复制刚创建的工作副本，作为任务开始时的项目快照。
 
@@ -88,9 +106,6 @@ def create_baseline_snapshot(working_project: str) -> Path:
             f"基线快照已经存在：{snapshot_path}"
         )
 
-    shutil.copytree(
-        project_path,
-        snapshot_path,
-    )
+    _copy_project(project_path, snapshot_path, policy)
 
     return snapshot_path

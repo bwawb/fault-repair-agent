@@ -5,6 +5,7 @@ from pathlib import Path
 from uuid import uuid4
 
 from langchain_core.messages import AIMessage, ToolMessage
+from output_protection import current_output
 
 
 def build_run_report(
@@ -145,6 +146,9 @@ def save_run_report(
 
 def write_run_report(report: dict, report_path: Path) -> None:
     """先写临时文件，再替换原报告，避免写入中断时留下半份 JSON。"""
+    protection = current_output()
+    protection.require_exact(report_path)
+    report = protection.report_copy(report)
     temporary_file = NamedTemporaryFile(
         mode="w", encoding="utf-8", dir=report_path.parent, delete=False
     )

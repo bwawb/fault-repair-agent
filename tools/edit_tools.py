@@ -3,6 +3,7 @@ from pathlib import Path
 
 from typing_extensions import TypedDict
 
+from file_access import DEFAULT_FILE_ACCESS, FileAccessPolicy
 from patch_summary import build_text_diff
 
 
@@ -33,23 +34,21 @@ def validate_file_changes(files: object) -> None:
             raise ValueError(f"第 {index} 个文件必须只包含 relative_path 和 replacements。")
 
 
-def resolve_edit_target(project_root: Path, relative_path: str) -> Path:
+def resolve_edit_target(
+    project_root: Path, relative_path: str, *, policy: FileAccessPolicy = DEFAULT_FILE_ACCESS
+) -> Path:
     if not isinstance(relative_path, str) or not relative_path.strip() or Path(relative_path).anchor:
         raise ValueError("请提供相对于工作副本的文件路径。")
-    requested_path = project_root / relative_path
-    path = requested_path.resolve(strict=False)
-    if not path.is_relative_to(project_root):
-        raise ValueError("不允许修改工作目录之外的文件。")
+    path = policy.resolve_file(project_root, relative_path)
     if any(Path(part) == Path("tests") for part in path.relative_to(project_root).parts):
         raise ValueError("当前阶段不允许修改 tests 目录中的文件。")
-    if requested_path.is_symlink():
-        raise ValueError(f"不允许修改符号链接：{relative_path}")
-    if not path.is_file():
-        raise ValueError(f"目标文件不存在或不是普通文件：{relative_path}")
     return path
 
 
-def prepare_file_changes(project_root: Path, files: list[FileChange], results: list[dict]) -> list[PreparedFile]:
+def prepare_file_changes(
+    project_root: Path, files: list[FileChange], results: list[dict],
+    *, policy: FileAccessPolicy = DEFAULT_FILE_ACCESS,
+) -> list[PreparedFile]:
     """预检所有文件，并在失败时留下对应的文件结果。"""
     validate_file_changes(files)
     results.extend({"relative_path": entry["relative_path"], "status": "not_attempted"} for entry in files)
@@ -58,7 +57,7 @@ def prepare_file_changes(project_root: Path, files: list[FileChange], results: l
     for entry, result in zip(files, results):
         relative_path = entry["relative_path"]
         try:
-            path = resolve_edit_target(project_root, relative_path)
+            path = resolve_edit_target(project_root, relative_path, policy=policy)
             if path in targets:
                 raise ValueError("同一个文件不能在 files 中重复出现。")
             targets.add(path)
@@ -160,7 +159,7 @@ def prepare_replacements(
 class EditTools:
     """在指定项目目录内预览文本修改"""
 
-    def __init__(self, project_path: str):
+    def __init__(self, project_path: str, *, policy: FileAccessPolicy = DEFAULT_FILE_ACCESS):
         """
         初始化修改工具。
 
@@ -168,6 +167,7 @@ class EditTools:
             project_path: 待分析项目的根目录。
         """
         self.project_path=Path(project_path).resolve()
+        self.policy = policy
 
         if not self.project_path.is_dir():
             raise ValueError( f"项目路径不是目录：{self.project_path}")
@@ -176,7 +176,7 @@ class EditTools:
         """预览本次任务的全部文件变更。"""
         results = []
         try:
-            prepared = prepare_file_changes(self.project_path, files, results)
+            prepared = prepare_file_changes(self.project_path, files, results, policy=self.policy)
         except ValueError as exc:
             return {"success": False, "message": str(exc), "diff": "", "files": results}
         return {
@@ -194,31 +194,8 @@ class EditTools:
 
     def preview_replacements(self, relative_path: str, replacements: list[TextReplacement]) -> dict:
         """预览同一文件中的全部替换。"""
-        requested_path = Path(relative_path)
-
-        if requested_path.anchor:
-            return {
-                "success": False,
-                "message": "请使用相对于项目根目录的路径。",
-                "diff": "",
-            }
-
         try:
-            file_path = (self.project_path / requested_path).resolve()
-            if not file_path.is_relative_to(self.project_path):
-                return {
-                    "success": False,
-                    "message": "不允许访问项目目录之外的文件。",
-                    "diff": "",
-                }
-
-            if not file_path.is_file():
-                return {
-                    "success": False,
-                    "message": f"目标文件不存在或不是文件：{relative_path}",
-                    "diff": "",
-                }
-
+            file_path = resolve_edit_target(self.project_path, relative_path, policy=self.policy)
             _, diff = prepare_replacements(file_path.read_bytes(), relative_path, replacements)
         except UnicodeError:
             return {

@@ -1,5 +1,6 @@
 import xml.etree.ElementTree as ET
 from pathlib import Path
+from stat import S_ISREG
 
 def read_test_report(report_path: str) -> dict[str, str]:
     """
@@ -15,15 +16,18 @@ def read_test_report(report_path: str) -> dict[str, str]:
     """
     path = Path(report_path)
 
-    if not path.is_file():
-        raise FileNotFoundError(f"测试报告不存在：{path}")
-
     try:
+        if not S_ISREG(path.stat().st_mode):
+            raise ValueError(f"测试报告路径不是普通文件：{path}")
         tree = ET.parse(path)
-    except ET.ParseError as exc:
+    except FileNotFoundError as exc:
+        raise FileNotFoundError(f"测试报告不存在：{path}") from exc
+    except (ET.ParseError, LookupError) as exc:
         raise ValueError(f"测试报告不是有效的 XML：{path}") from exc
 
     root = tree.getroot()
+    if root.tag not in {"testsuite", "testsuites"}:
+        raise ValueError(f"测试报告不是 JUnit XML：{path}")
     results = {}
 
     for case in root.iter("testcase"):

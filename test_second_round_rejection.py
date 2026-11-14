@@ -123,7 +123,7 @@ def test_reject_second_round_proposal(monkeypatch, tmp_path):
     monkeypatch.setattr(
         diagnosis_agent,
         "ToolRegistry",
-        lambda project_path: object(),
+        lambda project_path, **kwargs: object(),
     )
 
     monkeypatch.setattr(
@@ -230,7 +230,7 @@ def test_reject_second_round_proposal(monkeypatch, tmp_path):
     # 7. 运行真正的 main()
     # =========================================================
 
-    diagnosis_agent.main()
+    diagnosis_agent.main(keep_junit_xml=True)
 
     # =========================================================
     # 8. 读取真正保存的任务报告

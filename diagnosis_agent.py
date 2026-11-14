@@ -1,3 +1,5 @@
+import argparse
+
 from langchain.agents import create_agent
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langgraph.errors import GraphRecursionError
@@ -9,14 +11,16 @@ import json
 
 
 from demo_tool_call import create_model
+from model_redaction import ModelContentRedaction, ModelRedactionError
+from output_protection import OutputProtectionError, current_output, emit, protect_output
 from tools.langchain_tools import create_langchain_tools
 from tools.tool_registry import ToolRegistry
 from run_report import build_run_report, save_run_report
 from proposal import extract_latest_preview
 from apply_proposal import confirm_and_apply
-from tools.test_tools import TestTools
+from tools.test_tools import REPORT_ERROR_STATUSES, TEST_RESULT_STATUSES, TestTools
 from workspace import create_workspace, create_baseline_snapshot
-from compare_test_reports import read_test_report, compare_results
+from compare_test_reports import compare_results
 from repair_decision import decide_next_step
 from patch_summary import build_file_diff
 
@@ -50,6 +54,7 @@ SYSTEM_PROMPT = """
 6. 最终回答应包含故障位置、原因、证据、修改预览和不确定之处。
 7. 预览工具只生成预览，不会修改文件。
 8. 不要声称修改已经应用，也不要声称修改后的测试已经通过。
+9. 如果看到 [REDACTED]，表示该处内容被遮盖。请使用可完整核对的路径和文本；如无法准确定位，请说明原因。
 """
 
 
@@ -206,10 +211,10 @@ def record_cumulative_patches(working_project, baseline_project, apply_result, r
                 raise ValueError("恢复失败后无法确认文件仍是本轮写入的版本。")
             diff = build_file_diff(str(baseline_project), str(working_project), relative_path)
         except (OSError, ValueError, RuntimeError) as exc:
-            print(f"{relative_path} 生成累计 diff 失败：{exc}")
+            emit(f"{relative_path} 生成累计 diff 失败：{exc}")
             patch = {"status": "error", "diff": None, "message": str(exc)}
         else:
-            print(diff or f"{relative_path} 与基线快照相比没有内容变化。")
+            emit(diff or f"{relative_path} 与基线快照相比没有内容变化。")
             patch = {"status": "generated" if diff else "unchanged", "diff": diff, "message": None}
 
         patch.update(relative_path=relative_path, file_hash=file_hash)
@@ -221,6 +226,22 @@ def record_cumulative_patches(working_project, baseline_project, apply_result, r
     elif patches:
         round_record["cumulative_patch"] = next(iter(patches.values()))
 
+def show_test_run(result: dict) -> None:
+    emit(f"运行状态：{result['status']}")
+    emit(f"pytest 退出码：{result['exit_code']}")
+    if result["output"]:
+        emit(result["output"])
+    if result["error"]:
+        emit(f"测试错误：{result['error']}")
+    xml = result.get("junit_xml", {})
+    if xml.get("status") in {"retained", "cleanup_failed", "unverified"}:
+        path = result.get("report_path") or xml.get("staging_path")
+        emit(f"原始 JUnit XML 可能含有敏感内容。状态 {xml['status']}，路径 {path}")
+    docker_xml = result.get("docker_xml_staging", {})
+    if docker_xml.get("status") == "cleanup_failed":
+        emit(f"Docker 原始 XML 临时目录清理失败：{docker_xml['path']}")
+
+
 def verify_round(
         test_tools,
         after_fix_path,
@@ -229,84 +250,33 @@ def verify_round(
         round_record: dict,
 ) -> dict:
     """
-    运行修复后测试，解析报告，并与最初基线比较
-
-    Returns:
-        成功：
-            {
-                "success": True,
-                "after_results": {…},
-                "comparison": {…},
-            }
-
-        失败：
-            {
-                "success": False,
-                "status": 结束原因,
-                "messages": 错误说明
-            }
+    运行修复后测试，并将已核验的测试结果与最初基线比较。
     """
-    print("\n===== 运行修复后测试 =====")
+    emit("\n===== 运行修复后测试 =====")
 
     after_run = test_tools.run_tests_with_report(
         report_path=str(after_fix_path)
     )
+    current_output().register_test_ids(after_run["test_results"])
 
-    print(f"运行状态：{after_run['status']}")
-    print(f"pytest 退出码：{after_run['exit_code']}")
-    print("测试输出：")
-    print(after_run["output"])
-
-    # 先记录测试进程信息
-    report["verification"]["after_fix"] = {
-        "status": after_run["status"],
-        "exit_code": after_run["exit_code"],
-        "output": after_run["output"],
-        "report_path": str(after_fix_path),
-        "test_results": None,
-    }
-
+    show_test_run(after_run)
+    report["verification"]["after_fix"] = after_run
     round_record["verification"] = {
-        "after_fix": deepcopy(report["verification"]["after_fix"]),
+        "after_fix": deepcopy(after_run),
         "comparison": None,
     }
-
-    save_checkpoint(report)
-
-    # completed表示进程结束，退出码仍需要单独检查
-    if after_run["status"] != "completed" or after_run["exit_code"] not in (0, 1):
-        message = "修复后测试未正常完成，无法比较测试结果。"
-        round_record["status"] = "after_test_error"
-
-        return {
-            "success": False,
-            "status": "after_test_error",
-            "message": message,
-        }
-
-    try:
-        after_results = read_test_report(after_run["report_path"])
-    except (OSError, ValueError) as exc:
-        message = f"读取修复后测试报告失败：{exc}"
-
-        report["verification"]["after_fix"]["report_error"] = str(exc)
-        round_record["verification"]["after_fix"] = deepcopy(
-            report["verification"]["after_fix"]
+    after_results = after_run["test_results"]
+    if after_run["status"] not in TEST_RESULT_STATUSES or not after_results:
+        status = (
+            "after_report_error"
+            if after_run["status"] in REPORT_ERROR_STATUSES else "after_test_error"
         )
-        round_record["status"] = "after_report_error"
-
+        round_record["status"] = status
         return {
             "success": False,
-            "status": "after_report_error",
-            "message": message,
+            "status": status,
+            "message": "修复后没有可靠的测试结果，无法比较。",
         }
-
-    # 记录每个测试的修复后状态
-    report["verification"]["after_fix"]["test_results"] = after_results
-    round_record["verification"]["after_fix"] = deepcopy(
-        report["verification"]["after_fix"]
-    )
-    save_checkpoint(report)
 
     # 与任务开始时的基线比较
     comparison = compare_results(
@@ -328,11 +298,29 @@ def verify_round(
 
 
 
-def main():
-    # 修改为你自己的示例项目路径。
+def main(
+    test_backend="local", docker_image=None, *, local_env_names=(),
+    sensitive_values=(), user_request=None, keep_junit_xml=False,
+    source_project=r"E:\PythonProject\demo-python-project",
+    workspace_base=r"E:\PythonProject\fault-repair-agent\copy",
+):
+    model_redaction = ModelContentRedaction(sensitive_values)
+    with protect_output(sensitive_values) as protection:
+        try:
+            return _run_task(test_backend, docker_image, local_env_names, model_redaction,
+                             user_request, keep_junit_xml, str(source_project), str(workspace_base))
+        except OutputProtectionError as exc:
+            emit(str(exc))
+            return "output_protection_error"
+        except Exception:
+            if not protection.enabled:
+                raise
+            emit("任务遇到异常，已隐藏原始错误内容。")
+            return "task_error"
 
-    source_project = r"E:\PythonProject\demo-python-project"
 
+def _run_task(test_backend, docker_image, local_env_names, model_redaction, user_request, keep_junit_xml,
+              source_project, workspace_base):
     # 1. 创建任务 ID
     run_id = uuid4().hex
 
@@ -340,12 +328,13 @@ def main():
     started_at = datetime.now().astimezone().isoformat()
 
     # 3. 用户任务
-    user_request = (
-        "订单折扣计算存在问题。"
-        "请运行测试，找到折扣问题的相关代码，"
-        "分析故障原因，并生成最小修改的 diff 预览。"
-        "本次只处理订单折扣问题。"
-    )
+    if user_request is None:
+        user_request = (
+            "订单折扣计算存在问题。"
+            "请运行测试，找到折扣问题的相关代码，"
+            "分析故障原因，并生成最小修改的 diff 预览。"
+            "本次只处理订单折扣问题。"
+        )
 
     # 本次任务要修复的目标测试
     # 格式与read_test_report()返回测试标识保持一致
@@ -354,12 +343,12 @@ def main():
     ]
 
     # 4. 创建工作副本
-    working_project = create_workspace(source_project, r"E:\PythonProject\fault-repair-agent\copy")
+    working_project = create_workspace(source_project, workspace_base)
 
-    print(f"工作副本：{working_project}")
+    emit(f"工作副本：{working_project}")
 
     baseline_project = create_baseline_snapshot(str(working_project))
-    print(f"基线快照：{baseline_project}")
+    emit(f"基线快照：{baseline_project}")
 
     # 5. 初始化统一任务报告
     report = build_run_report(
@@ -380,7 +369,7 @@ def main():
     # 6. 首次保存报告
     report_path = save_checkpoint(report)
 
-    print(f"任务报告：{report_path}")
+    emit(f"任务报告：{report_path}")
     # project_path = r"E:\PythonProject\demo-python-project"
 
     # run_id = uuid4().hex
@@ -390,57 +379,33 @@ def main():
     baseline_path = report_dir / f"baseline_{run_id}.xml"
     # after_fix_path = report_dir / f"after_fix_{run_id}.xml"
 
-    test_tools = TestTools(str(working_project))
-    print("\n===== 运行修复前测试 =====")
+    test_tools = TestTools(
+        str(working_project), execution_mode=test_backend, docker_image=docker_image,
+        local_env_names=local_env_names, keep_junit_xml=keep_junit_xml,
+    )
+    emit("\n===== 运行修复前测试 =====")
 
     baseline_run = test_tools.run_tests_with_report(
         report_path=str(baseline_path),
     )
+    current_output().register_test_ids(baseline_run["test_results"])
 
-    print(f"运行状态：{baseline_run['status']}")
-    print(f"pytest 退出码：{baseline_run['exit_code']}")
-    print(baseline_run["output"])
-
-    # 将修复前测试的执行结果写入统一报告
-    report['verification']['baseline']={
-        "status": baseline_run["status"],
-        "exit_code": baseline_run["exit_code"],
-        "output": baseline_run["output"],
-        "report_path":str(baseline_path),
-        "test_results": None
-    }
-
-    # 保存当前进度
+    show_test_run(baseline_run)
+    report["verification"]["baseline"] = baseline_run
     save_checkpoint(report)
 
-    # # 仅用于本次验证，验证后删除
-    # baseline_run["status"] = "simulated_error"
-
-    if baseline_run["status"] != "completed" or baseline_run["exit_code"] not in (0, 1):
-        print("修复前测试未正常完成，无法建立测试基线。")
-        print(f"工作副本：{working_project}")
-
-        # 记录任务因基线测试无法完成而结束
-        finish_report(report, final_status="baseline_test_error")
-        return
-
-    try:
-        baseline_results = read_test_report(
-            baseline_run["report_path"]
+    baseline_results = baseline_run["test_results"]
+    if baseline_run["status"] not in TEST_RESULT_STATUSES or not baseline_results:
+        emit("修复前没有可靠的测试结果，无法建立基线。")
+        emit(f"工作副本：{working_project}")
+        final_status = (
+            "baseline_report_error"
+            if baseline_run["status"] in REPORT_ERROR_STATUSES else "baseline_test_error"
         )
-    except (OSError, ValueError) as exc:
-        print(f"读取修复前测试报告失败：{exc}")
-
-        # 将失败原因写入报告，便于排查
-        report["verification"]["baseline"]["report_error"] = str(exc)
-        finish_report(report, final_status="baseline_report_error")
-
+        finish_report(report, final_status=final_status)
         return
 
-    # 将解析后的测试状态写入报告
-    report["verification"]["baseline"]["test_results"] = baseline_results
-
-    print("\n===== 检查目标测试基线 =====")
+    emit("\n===== 检查目标测试基线 =====")
 
     # 检查目标测试是否都存在于基线报告
     missing_targets = [
@@ -450,9 +415,9 @@ def main():
     ]
 
     if missing_targets:
-        print("以下目标测试不在基线报告中：")
+        emit("以下目标测试不在基线报告中：")
         for test_id in missing_targets:
-            print(f"  {test_id}")
+            emit(f"  {test_id}")
 
         report["verification"]["target_baseline"] = {
             "status": "missing",
@@ -478,13 +443,13 @@ def main():
     save_checkpoint(report)
 
     for test_id, status in target_baseline_results.items():
-        print(f"  {test_id}: {status}")
+        emit(f"  {test_id}: {status}")
 
     # 1.创建模型
     model = create_model()
 
     # 2.创建已有工具的注册表
-    registry = ToolRegistry(str(working_project))
+    registry = ToolRegistry(str(working_project), test_tools=test_tools)
 
     # 3.将现有工具包装为LangChain工具
     tools = create_langchain_tools(registry)
@@ -493,7 +458,8 @@ def main():
     agent = create_agent(
         model=model,
         tools=tools,
-        system_prompt=SYSTEM_PROMPT
+        system_prompt=SYSTEM_PROMPT,
+        middleware=[model_redaction] if model_redaction.enabled else [],
     )
 
     # 多轮修复的最大轮数
@@ -501,6 +467,8 @@ def main():
 
     # 第一轮使用原始用户任务
     round_request = user_request
+    feedback = None
+    feedback_prompt = ""
 
     # 保存初始状态，用于每一轮开始时重置顶层字段
     initial_agent = deepcopy(report["agent"])
@@ -508,13 +476,13 @@ def main():
     initial_approval = deepcopy(report["approval"])
     initial_application = deepcopy(report["application"])
 
-    print(f"\n最多进行 {max_rounds} 轮修复。")
+    emit(f"\n最多进行 {max_rounds} 轮修复。")
 
 
 
     for current_round in range(1, max_rounds + 1):
 
-        print(f"\n========== 第 {current_round} 轮修复 ==========")
+        emit(f"\n========== 第 {current_round} 轮修复 ==========")
 
         # 创建当前轮次的独立记录
         round_record = {
@@ -548,34 +516,43 @@ def main():
         save_checkpoint(report)
 
 
-        print("===== 开始故障分析 =====")
-        print(f"本轮任务：{round_request}")
+        emit("===== 开始故障分析 =====")
+        emit(f"本轮任务：{round_request}")
 
         try:
+            model_request = round_request
+            if feedback is not None and model_redaction.enabled:
+                safe_ids = current_output().with_test_aliases(feedback)
+                model_request = feedback_prompt + model_redaction.redact_feedback(safe_ids)
             result = run_diagnosis(
                 agent=agent,
-                user_request=round_request
+                user_request=model_request,
             )
+        except ModelRedactionError as exc:
+            emit(str(exc))
+            round_record.update(status="model_redaction_error", error=str(exc))
+            finish_report(report, final_status="model_redaction_error")
+            return
         except GraphRecursionError:
-            print("\nAgent 达到执行步数上限，分析未完成。")
+            emit("\nAgent 达到执行步数上限，分析未完成。")
             round_record["status"] = "agent_step_limit"
             finish_report(report, final_status="agent_step_limit")
             return
 
         # 6. 查看 Agent 运行过程中产生的消息。
-        # print("\n===== Agent 执行过程 =====")
+        # emit("\n===== Agent 执行过程 =====")
         # for message in result["messages"]:
         #     if isinstance(message, AIMessage) and message.tool_calls:
         #         for tool_call in message.tool_calls:
-        #             print(f"\n模型请求工具：{tool_call['name']}")
-        #             print(f"工具参数：{tool_call['args']}")
+        #             emit(f"\n模型请求工具：{tool_call['name']}")
+        #             emit(f"工具参数：{tool_call['args']}")
         #     elif isinstance(message, ToolMessage):
-        #         print(f"\n工具返回，tool_call_id：{message.tool_call_id}")
-        #         print(message.content)
+        #         emit(f"\n工具返回，tool_call_id：{message.tool_call_id}")
+        #         emit(message.content)
 
         # 7. 显示最终回答。
-        print("\n===== 最终故障分析 =====")
-        print(result["messages"][-1].content)
+        emit("\n===== 最终故障分析 =====")
+        emit(result["messages"][-1].content)
 
         # 整理 Agent 本次运行的消息。
         agent_report = build_run_report(
@@ -595,9 +572,9 @@ def main():
         # # 保存到原来的 JSON 文件。
         # report_path = save_checkpoint(report)
 
-        print(f"任务报告已更新：{report_path}")
+        emit(f"任务报告已更新：{report_path}")
 
-        print("\n===== 提取修改提案 =====")
+        emit("\n===== 提取修改提案 =====")
 
         proposal_result = prepare_round_proposal(
             messages=result["messages"],
@@ -606,7 +583,7 @@ def main():
         )
 
         if not proposal_result["success"]:
-            print(proposal_result["message"])
+            emit(proposal_result["message"])
             finish_report(report, final_status="proposal_unavailable")
             return
 
@@ -616,12 +593,12 @@ def main():
         save_checkpoint(report)
 
 
-        print(f"工具调用 ID：{proposal['tool_call_id']}")
+        emit(f"工具调用 ID：{proposal['tool_call_id']}")
         target_files = proposal.get("files", [proposal])
         target_paths = [file["relative_path"] for file in target_files]
-        print("目标文件：" + "、".join(target_paths))
+        emit("目标文件：" + "、".join(target_paths))
 
-        print("\n===== 确认并应用修改 =====")
+        emit("\n===== 确认并应用修改 =====")
 
         apply_result = apply_round_proposal(
             working_project=working_project,
@@ -630,25 +607,26 @@ def main():
             round_record=round_record
         )
 
-        print(f"修改状态：{apply_result['status']}")
-        print(f"说明：{apply_result['message']}")
+        emit(f"修改状态：{apply_result['status']}")
+        emit(f"说明：{apply_result['message']}")
 
         if apply_result["status"] in {"applied", "partial"}:
-            print("\n===== 当前文件的累计修改 =====")
+            emit("\n===== 当前文件的累计修改 =====")
             record_cumulative_patches(
                 working_project, baseline_project, apply_result, report, round_record
             )
 
         if apply_result["status"] != "applied":
-            print(f"\n本次工作副本保存在：{working_project}")
+            emit(f"\n本次工作副本保存在：{working_project}")
 
             if apply_result["status"] == "rejected":
                 round_record["status"] = "cancelled"
                 finish_report(report, final_status="cancelled")
             else:
-                final_status = (
-                    "application_partial" if apply_result["status"] == "partial" else "application_error"
-                )
+                final_status = {
+                    "partial": "application_partial",
+                    "approval_blocked": "approval_blocked",
+                }.get(apply_result["status"], "application_error")
                 round_record["status"] = final_status
                 finish_report(report, final_status=final_status)
 
@@ -666,8 +644,8 @@ def main():
         )
 
         if not verification_result["success"]:
-            print(verification_result["message"])
-            print(f"工作副本：{working_project}")
+            emit(verification_result["message"])
+            emit(f"工作副本：{working_project}")
 
             finish_report(
                 report,
@@ -687,18 +665,18 @@ def main():
             max_rounds=max_rounds,
         )
 
-        print("\n===== 本轮测试结果对比 =====")
-        print(f"恢复通过：{comparison['fixed']}")
-        print(f"仍然失败：{comparison['still_failing']}")
-        print(f"新增失败：{comparison['newly_failed']}")
-        print(f"状态无法直接比较：{comparison['uncertain']}")
-        print(f"仅出现在修复前：{comparison['only_before']}")
-        print(f"仅出现在修复后：{comparison['only_after']}")
+        emit("\n===== 本轮测试结果对比 =====")
+        emit(f"恢复通过：{comparison['fixed']}")
+        emit(f"仍然失败：{comparison['still_failing']}")
+        emit(f"新增失败：{comparison['newly_failed']}")
+        emit(f"状态无法直接比较：{comparison['uncertain']}")
+        emit(f"仅出现在修复前：{comparison['only_before']}")
+        emit(f"仅出现在修复后：{comparison['only_after']}")
 
-        print("\n===== 下一步决策 =====")
-        print(f"动作：{decision['action']}")
-        print(f"原因：{decision['reason']}")
-        print(f"详情：{decision['details']}")
+        emit("\n===== 下一步决策 =====")
+        emit(f"动作：{decision['action']}")
+        emit(f"原因：{decision['reason']}")
+        emit(f"详情：{decision['details']}")
 
         # 保存当前轮决策
         round_record["decision"] = deepcopy(decision)
@@ -722,11 +700,12 @@ def main():
                 final_status=final_status,
             )
 
-            print(f"\n任务结束：{final_status}")
-            print(f"修复前报告：{baseline_path}")
-            print(f"本轮修复后报告：{after_fix_path}")
-            print(f"工作副本：{working_project}")
-            print(f"最终任务报告：{report_path}")
+            emit(f"\n任务结束：{final_status}")
+            for label, run in (("修复前", baseline_run), ("本轮修复后", report["verification"]["after_fix"])):
+                if run and run.get("junit_xml", {}).get("status") == "retained":
+                    emit(f"{label}报告：{run['report_path']}")
+            emit(f"工作副本：{working_project}")
+            emit(f"最终任务报告：{report_path}")
 
             return
 
@@ -739,7 +718,7 @@ def main():
                 final_status="invalid_decision",
             )
 
-            print(f"\n无法识别的决策动作：{decision['action']}")
+            emit(f"\n无法识别的决策动作：{decision['action']}")
             return
 
         # 只有 decision["action"] == "retry" 才会执行到这里。
@@ -757,7 +736,7 @@ def main():
             "test_output": report["verification"]["after_fix"]["output"],
         }
 
-        round_request = (
+        feedback_prompt = (
             f"{user_request}\n\n"
             f"这是第 {current_round + 1} 轮修复。\n"
             "上一轮的修改已经应用到当前工作副本，"
@@ -766,10 +745,10 @@ def main():
             "生成新提案前，请重新读取当前工作副本中的相关文件。\n"
             "继续只处理原任务指定的目标。\n\n"
             "上一轮结果：\n"
-            f"{json.dumps(feedback, ensure_ascii=False, indent=2)}"
         )
+        round_request = feedback_prompt + json.dumps(feedback, ensure_ascii=False, indent=2)
 
-        print(
+        emit(
             f"\n目标测试仍未通过，"
             f"准备进入第 {current_round + 1} 轮。"
         )
@@ -781,13 +760,29 @@ def main():
         final_status="loop_ended_unexpectedly",
     )
 
-    print("\n修复循环异常结束，请检查轮次决策。")
+    emit("\n修复循环异常结束，请检查轮次决策。")
 
 
-    # print("\n===== 运行记录 =====")
-    # print(f"模型消息数量：{report['model_message_count']}")
-    # print(f"工具调用数量：{report['tool_call_count']}")
-    # print(f"报告保存位置：{report_path.resolve()}")
+    # emit("\n===== 运行记录 =====")
+    # emit(f"模型消息数量：{report['model_message_count']}")
+    # emit(f"工具调用数量：{report['tool_call_count']}")
+    # emit(f"报告保存位置：{report_path.resolve()}")
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description="运行故障诊断和修复任务。")
+    parser.add_argument("--test-backend", choices=("local", "docker"), default="local")
+    parser.add_argument("--docker-image", help="预先准备好的本地 Linux Python/pytest 镜像")
+    parser.add_argument("--keep-junit-xml", action="store_true", help="保留可能含有敏感内容的原始 JUnit XML")
+    parser.add_argument(
+        "--test-env", action="append", default=[], metavar="NAME",
+        help="传入一个已设置的环境变量，仅适用于 local，可重复指定",
+    )
+    options = parser.parse_args()
+    if (options.test_backend == "docker") != bool(options.docker_image):
+        parser.error("--test-backend docker 必须与 --docker-image 一起使用。")
+    if options.test_backend == "docker" and options.test_env:
+        parser.error("--test-env 仅适用于 local 后端。")
+    status = main(test_backend=options.test_backend, docker_image=options.docker_image,
+                  local_env_names=options.test_env, keep_junit_xml=options.keep_junit_xml)
+    if status:
+        raise SystemExit(1)

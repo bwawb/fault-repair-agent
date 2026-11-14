@@ -1,3 +1,4 @@
+from file_access import DEFAULT_FILE_ACCESS, FileAccessPolicy
 from tools.file_tools import FileTools
 from tools.test_tools import TestTools
 from tools.edit_tools import EditTools
@@ -5,17 +6,22 @@ from tools.edit_tools import EditTools
 class ToolRegistry:
     """注册工具，并根据工具名称执行对应的函数"""
 
-    def __init__(self, project_path: str):
+    def __init__(
+        self, project_path: str, *, test_tools: TestTools | None = None,
+        policy: FileAccessPolicy = DEFAULT_FILE_ACCESS,
+    ):
         """
         初始化工具注册表。
 
         Args:
             project_path: 待分析项目的根目录。
+            test_tools: 主任务的测试执行器。省略时使用本地执行器。
+            policy: 文件读取和补丁预览共用的策略。
         """
 
-        self.file_tools = FileTools(project_path)
-        self.test_tools = TestTools(project_path)
-        self.edit_tools = EditTools(project_path)
+        self.file_tools = FileTools(project_path, policy=policy)
+        self.test_tools = TestTools(project_path) if test_tools is None else test_tools
+        self.edit_tools = EditTools(project_path, policy=policy)
 
         # 工具名称与python方法的对应关系
         self.tools = {

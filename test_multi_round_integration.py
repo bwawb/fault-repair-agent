@@ -121,7 +121,7 @@ def test_cumulative_patch_report(monkeypatch, tmp_path, round_count, diff_fails)
     monkeypatch.setattr(
         diagnosis_agent,
         "ToolRegistry",
-        lambda project_path: object(),
+        lambda project_path, **kwargs: object(),
     )
 
     monkeypatch.setattr(
@@ -237,7 +237,7 @@ def test_cumulative_patch_report(monkeypatch, tmp_path, round_count, diff_fails)
     # 7. 运行真正的 main()
     # =========================================================
 
-    diagnosis_agent.main()
+    diagnosis_agent.main(keep_junit_xml=True)
 
     # =========================================================
     # 8. 读取真正保存的任务报告

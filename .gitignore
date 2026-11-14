@@ -5,3 +5,9 @@ __pycache__/
 .pytest_cache/
 outputs/
 fault_repair_*/
+pytest_docker_run_01/
+docker-pytest-image/
+.pytest_tmp/
+$repairMultiFileTemp/
+fault_repair*/
+pytest*/
